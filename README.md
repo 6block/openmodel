@@ -12,10 +12,10 @@ openmodel-delivery/
 │   ├── sidecar-8gpu-multi.yaml    # 8 GPU multi-instance (recommended for small models)
 │   ├── sidecar-8gpu-tensor.yaml   # 8 GPU tensor parallel (for large 14B+ models)
 │   └── sidecar-foc.yaml           # FOC model download test
-└── images/                    # Docker image tar archives
-    ├── openmodel-scheduler.tar
-    ├── openmodel-inference.tar
-    └── openmodel-foc-bridge.tar
+└── images/                    # Docker image tar archives (⬇ GitHub Release)
+    ├── openmodel-scheduler.tar          ⬇ Release asset
+    ├── openmodel-inference.tar.part_*    ⬇ Release asset (7 parts, reassemble before use)
+    └── openmodel-foc-bridge.tar          ⬇ Release asset
 ```
 
 ## 1. Prerequisites

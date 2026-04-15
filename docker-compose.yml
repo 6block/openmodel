@@ -1,0 +1,84 @@
+services:
+  scheduler:
+    image: openmodel-scheduler:latest
+    container_name: openmodel-scheduler
+    network_mode: host
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    environment:
+      - LOTUS_API_TOKEN=${LOTUS_API_TOKEN}
+      - SIDECAR_CONFIG=${SIDECAR_CONFIG:-sidecar-prod-test.yaml}
+    volumes:
+      - ./config:/etc/sidecar:ro
+      - /tmp/curio.log:/tmp/curio.log:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  inference:
+    image: openmodel-inference:latest
+    container_name: openmodel-inference
+    network_mode: host
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    ipc: host
+    environment:
+      - SCHEDULER_GRPC_ADDR=localhost:50051
+      - SIDECAR_CONFIG=${SIDECAR_CONFIG:-sidecar-prod-test.yaml}
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HF_HOME=/root/.cache/huggingface
+      - MODEL_CACHE_DIR=/models
+    volumes:
+      - ./config:/etc/sidecar:ro
+      - ${MODEL_CACHE_DIR:-~/openmodel/models}:/models
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      scheduler:
+        condition: service_healthy
+    restart: unless-stopped
+    shm_size: '16gb'
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
+  foc-bridge:
+    image: openmodel-foc-bridge:latest
+    container_name: openmodel-foc-bridge
+    network_mode: host
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    environment:
+      - FOC_PRIVATE_KEY=${FOC_PRIVATE_KEY:-}
+      - FOC_RPC_URL=${FOC_RPC_URL:-https://api.calibration.node.glif.io/rpc/v1}
+      - FOC_BRIDGE_PORT=${FOC_BRIDGE_PORT:-3100}
+      - SP_URL_PRIMARY=${SP_URL_PRIMARY:-https://caliberation-pdp.infrafolio.com/piece}
+      - SP_URL_SECONDARY=${SP_URL_SECONDARY:-https://calib2.ezpdpz.net/piece}
+    volumes:
+      - ${MODEL_CACHE_DIR:-~/openmodel/models}:/models
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3100/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

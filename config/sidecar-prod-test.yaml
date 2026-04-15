@@ -1,0 +1,73 @@
+# OpenModel — Production Test Configuration
+# Server: 8x RTX 3080, single GPU 0 test
+# Real Lotus daemon + real Curio DB + real vLLM
+mode: prod
+
+# Lotus daemon (full node) connection
+lotus:
+  api_url: "ws://localhost:1234/rpc/v0"
+  api_token: "${LOTUS_API_TOKEN}"
+  miner_address: "t0182063"
+  poll_interval_sec: 15
+  connect_timeout_sec: 10
+
+# Curio DB (YugabyteDB) — proof completion detection
+curio:
+  dsn: "host=localhost port=5433 user=yugabyte dbname=yugabyte sslmode=disable search_path=curio"
+  proof_poll_interval_sec: 5     # Poll wdpost_proofs every 5 seconds
+  proof_max_wait_sec: 1800       # 30 min safety timeout (proof can take 15+ min)
+  log_path: "/tmp/curio.log"    # Curio log path for fast WinningPoSt detection
+
+# Yield-to-mining scheduler policy
+scheduler:
+  window_post:
+    graceful_yield_threshold_sec: 300   # Start graceful yield 5 min before deadline open
+    hard_stop_threshold_sec: 120        # Force stop 2 min before deadline open
+    resume_delay_after_close_sec: 60    # Resume 1 min after deadline close (only without proof detection)
+    yield_during_fault_cutoff: false
+    proof_detection_enabled: true       # Resume inference immediately when proof is detected
+
+  winning_post:
+    enabled: true     # Detect actual wins via Curio DB mining_tasks.won
+    resume_delay_sec: 30
+    timeout_sec: 35
+
+  fail_safe_on_disconnect: true
+
+# gRPC communication
+grpc:
+  port: 50051
+  max_message_size_mb: 4
+
+# AI Inference engine — real vLLM, single GPU 0
+inference:
+  engine: "vllm"
+  model: "Qwen/Qwen2.5-1.5B-Instruct"
+  gpu_memory_utilization: 0.80
+  max_model_len: 4096
+  api_port: 8000
+
+  multi_gpu:
+    mode: "tensor_parallel"
+    gpu_count: 1
+    device_ids: [0]
+    mock_gpu_count: 1
+
+  multi_instance:
+    load_balancer: "round_robin"
+
+# FOC — mock (not used in this test)
+foc:
+  backend: "mock"
+  mock:
+    model_registry: {}
+    simulate_delay: false
+
+# Observability
+metrics:
+  port: 9090
+  enabled: true
+
+logging:
+  level: "info"
+  format: "text"

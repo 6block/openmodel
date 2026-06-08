@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package sidecar;
+
+option go_package = "openmodel/go-scheduler/proto/sidecar";
+
+// GPU availability state managed by the scheduler.
+enum GpuState {
+  GPU_STATE_UNKNOWN = 0;
+  GPU_STATE_AVAILABLE = 1;      // Safe for AI inference
+  GPU_STATE_YIELDING = 2;       // WindowPoSt deadline approaching, graceful pause
+  GPU_STATE_WINDOW_POST = 3;    // WindowPoSt in progress, no inference allowed
+  GPU_STATE_WINNING_POST = 4;   // WinningPoSt triggered, immediate GPU release
+}
+
+// Urgency level for yield commands sent to inference service.
+enum YieldUrgency {
+  YIELD_URGENCY_NORMAL = 0;     // Drain in-flight requests (up to 30s), then pause
+  YIELD_URGENCY_IMMEDIATE = 1;  // Abort in-flight requests and stop now
+}
+
+// Reason for the schedule event.
+enum YieldReason {
+  YIELD_REASON_UNKNOWN = 0;
+  YIELD_REASON_WINDOW_POST_APPROACHING = 1;
+  YIELD_REASON_WINDOW_POST_ACTIVE = 2;
+  YIELD_REASON_WINNING_POST = 3;
+  YIELD_REASON_LOTUS_DISCONNECTED = 4;
+  YIELD_REASON_MANUAL = 5;
+  YIELD_REASON_RESUME = 6;
+}
+
+// Schedule event pushed from Go scheduler to Python inference service.
+message ScheduleEvent {
+  GpuState state = 1;
+  YieldUrgency urgency = 2;
+  int64 seconds_until_deadline = 3;
+  int64 current_epoch = 4;
+  int64 deadline_open_epoch = 5;
+  YieldReason reason = 6;
+  string message = 7;  // Human-readable description
+}
+
+// Status report from Python inference service to Go scheduler.
+message InferenceStatusReport {
+  bool is_running = 1;
+  int32 active_requests = 2;
+  float gpu_utilization_pct = 3;
+  string loaded_model = 4;
+  int64 timestamp_unix = 5;
+}
+
+// Request for getting current GPU schedule.
+message ScheduleRequest {}
+
+// Response with current GPU state.
+message ScheduleResponse {
+  GpuState current_state = 1;
+  int64 seconds_until_next_change = 2;
+  string message = 3;
+}
+
+// The scheduler service running in the Go component.
+service SchedulerService {
+  // Python polls for current GPU availability.
+  rpc GetGpuSchedule(ScheduleRequest) returns (ScheduleResponse);
+
+  // Go pushes schedule events to Python (server-streaming).
+  rpc SubscribeScheduleEvents(ScheduleRequest) returns (stream ScheduleEvent);
+
+  // Python reports its inference status to Go.
+  rpc ReportInferenceStatus(InferenceStatusReport) returns (ScheduleResponse);
+}

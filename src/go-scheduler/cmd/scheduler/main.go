@@ -22,6 +22,16 @@ import (
 	pb "openmodel/go-scheduler/proto/sidecar"
 )
 
+// parseMinerID extracts the numeric miner ID from a t0/f0-prefixed Filecoin
+// miner address (e.g. "t0182063" → 182063). Returns 0 for malformed input.
+func parseMinerID(addr string) int64 {
+	var id int64
+	if len(addr) > 2 && (addr[:2] == "t0" || addr[:2] == "f0") {
+		fmt.Sscanf(addr[2:], "%d", &id)
+	}
+	return id
+}
+
 func main() {
 	configPath := flag.String("config", "/etc/sidecar/sidecar-prod-test.yaml", "path to config file")
 	flag.Parse()
@@ -78,12 +88,7 @@ func main() {
 			MaxWait:      time.Duration(cfg.Curio.ProofMaxWaitSec) * time.Second,
 		}
 
-		var minerID int64
-		// Parse miner address to numeric ID (t0182063 → 182063)
-		addr := cfg.Lotus.MinerAddress
-		if len(addr) > 2 && (addr[:2] == "t0" || addr[:2] == "f0") {
-			fmt.Sscanf(addr[2:], "%d", &minerID)
-		}
+		minerID := parseMinerID(cfg.Lotus.MinerAddress)
 
 		if cfg.Mode == "dev" {
 			mockMonitor := curio.NewMockProofMonitor(30*time.Second, logger)
@@ -124,7 +129,7 @@ func main() {
 	// Start health/metrics server
 	var healthServer *health.Server
 	if cfg.Metrics.Enabled {
-		healthServer = health.NewServer(cfg.Metrics.Port, sched, logger, ctx)
+		healthServer = health.NewServer(cfg.Metrics.Port, sched, logger, ctx, cfg.Metrics.AuthToken)
 		go healthServer.Start()
 		logger.Info("metrics server started", "port", cfg.Metrics.Port)
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -46,10 +47,13 @@ type Server struct {
 	sched      *scheduler.Scheduler
 	logger     *slog.Logger
 	ctx        context.Context
+	token      string // if set, /ready and /debug/* require this Bearer token
 }
 
-// NewServer creates a new health/metrics server.
-func NewServer(port int, sched *scheduler.Scheduler, logger *slog.Logger, ctx context.Context) *Server {
+// NewServer creates a new health/metrics server. token, if non-empty, gates /ready
+// and the /debug/* endpoints (the gateway sends the per-worker token on its /ready
+// polls); /health and /metrics stay open for local healthchecks / internal scrapes.
+func NewServer(port int, sched *scheduler.Scheduler, logger *slog.Logger, ctx context.Context, token string) *Server {
 	mux := http.NewServeMux()
 
 	s := &Server{
@@ -60,21 +64,42 @@ func NewServer(port int, sched *scheduler.Scheduler, logger *slog.Logger, ctx co
 		sched:  sched,
 		logger: logger,
 		ctx:    ctx,
+		token:  token,
 	}
 
 	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/ready", s.handleReady)
+	mux.HandleFunc("/ready", s.requireToken(s.handleReady))
 	mux.Handle("/metrics", promhttp.Handler())
 
-	// Debug endpoints — available in all modes
-	mux.HandleFunc("/debug/trigger-winning-post", s.handleTriggerWinningPost)
-	mux.HandleFunc("/debug/sector-cache", s.handleSectorCache)
-	mux.HandleFunc("/debug/winning-post-status", s.handleWinningPostStatus)
+	// Debug endpoints — available in all modes; token-gated when configured so they
+	// cannot be triggered by anyone reaching the port (e.g. /debug/trigger-winning-post).
+	mux.HandleFunc("/debug/trigger-winning-post", s.requireToken(s.handleTriggerWinningPost))
+	mux.HandleFunc("/debug/sector-cache", s.requireToken(s.handleSectorCache))
+	mux.HandleFunc("/debug/winning-post-status", s.requireToken(s.handleWinningPostStatus))
+	if token != "" {
+		logger.Info("health server auth enabled: /ready and /debug/* require Bearer token")
+	} else {
+		logger.Warn("health server auth DISABLED — set metrics.auth_token (SCHEDULER_AUTH_TOKEN) or firewall this port; /debug/trigger-winning-post is otherwise open")
+	}
 	logger.Info("debug endpoints registered: POST /debug/trigger-winning-post, GET /debug/sector-cache, GET /debug/winning-post-status")
 
 	return s
 }
 
+// requireToken wraps a handler so it requires `Authorization: Bearer <token>` when a
+// token is configured. No-op (open) when the token is empty (trusted-LAN mode).
+func (s *Server) requireToken(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.token != "" {
+			got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+			if got != s.token {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
 
 func (s *Server) handleSectorCache(w http.ResponseWriter, r *http.Request) {
 	cache := s.sched.SectorCacheSnapshot()
@@ -117,11 +142,25 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	state := s.sched.CurrentState()
 	gpuStateGauge.Set(float64(state))
 
+	// B1 predictive routing: expose how long the current GPU state is expected to
+	// last. WindowPoSt deadlines are DETERMINISTIC on-chain, so while AVAILABLE this
+	// is "seconds until the graceful yield begins" — the gateway de-prioritizes
+	// workers about to yield instead of routing long streams into a known
+	// interruption. While mining it is the estimated seconds until resume (feeds an
+	// honest Retry-After). The field is placed BEFORE gpu_state= on purpose: older
+	// gateways parse everything after "gpu_state=" as the state string, so appending
+	// it there would break them.
+	untilChange := int64(-1) // unknown
 	if decision := s.sched.LatestDecision(); decision != nil {
 		epochsUntilDeadline.Set(float64(decision.SecondsUntilNextChange))
+		untilChange = decision.SecondsUntilNextChange
 	}
 
 	w.WriteHeader(http.StatusOK)
+	if untilChange >= 0 {
+		fmt.Fprintf(w, "ready, seconds_until_change=%d, gpu_state=%s\n", untilChange, state.String())
+		return
+	}
 	fmt.Fprintf(w, "ready, gpu_state=%s\n", state.String())
 }
 

@@ -52,9 +52,10 @@ func (w *LogWatcher) Watch(ctx context.Context) (<-chan struct{}, error) {
 
 	go func() {
 		defer close(ch)
-		defer f.Close()
+		cur := f
+		defer func() { cur.Close() }()
 
-		reader := bufio.NewReader(f)
+		reader := bufio.NewReader(cur)
 
 		for {
 			select {
@@ -65,7 +66,16 @@ func (w *LogWatcher) Watch(ctx context.Context) (<-chan struct{}, error) {
 
 			line, err := reader.ReadString('\n')
 			if err != nil {
-				// EOF — no new data yet, wait and retry
+				// EOF — before sleeping, check whether the log was rotated (a new
+				// inode now sits at logPath) or truncated (shrank below our offset).
+				// If so, reopen from the start so new entries aren't missed.
+				if nf := w.reopenIfRotated(cur); nf != nil {
+					cur.Close()
+					cur = nf
+					reader = bufio.NewReader(cur)
+					w.logger.Info("Curio log rotated/truncated, reopened", "path", w.logPath)
+					continue
+				}
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
@@ -84,6 +94,32 @@ func (w *LogWatcher) Watch(ctx context.Context) (<-chan struct{}, error) {
 	}()
 
 	return ch, nil
+}
+
+// reopenIfRotated returns a freshly-opened *os.File (positioned at the start) when
+// the file at logPath has been rotated (different inode) or truncated (size shrank
+// below the current read offset), else nil. The new file is read from the
+// beginning because all of its content is new since the rotation.
+func (w *LogWatcher) reopenIfRotated(cur *os.File) *os.File {
+	pathInfo, err := os.Stat(w.logPath)
+	if err != nil {
+		return nil // file briefly absent mid-rotation; keep current fd and retry
+	}
+	curInfo, err := cur.Stat()
+	if err != nil {
+		return nil
+	}
+	rotated := !os.SameFile(pathInfo, curInfo)
+	curOffset, _ := cur.Seek(0, io.SeekCurrent)
+	truncated := pathInfo.Size() < curOffset
+	if !rotated && !truncated {
+		return nil
+	}
+	nf, err := os.Open(w.logPath)
+	if err != nil {
+		return nil
+	}
+	return nf
 }
 
 func truncate(s string, maxLen int) string {

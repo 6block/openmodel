@@ -1,2 +1,8 @@
-images/
+__pycache__/
+*.pyc
+node_modules/
+.env
+*.key
 .DS_Store
+release/*.tar*
+.pytest_cache/

@@ -65,12 +65,19 @@ func NewDBClient(dsn string, logger *slog.Logger) (*DBClient, error) {
 	return &DBClient{db: db, logger: logger}, nil
 }
 
+// dbQueryTimeout bounds every Curio DB query so a DB lock-wait or network stall
+// cannot block the proof/WinningPoSt detection loop indefinitely (audit MEDIUM fix).
+// Context cancellation aborts the in-flight query.
+const dbQueryTimeout = 5 * time.Second
+
 // IsProofComplete checks if proof computation is done for ALL partitions in
 // the given deadline. A deadline may contain multiple partitions (each up to
 // 2349 sectors). Curio computes proofs sequentially per partition and writes
 // proof_params upon completion of each. We must wait until every partition
 // is done before resuming GPU for inference.
 func (c *DBClient) IsProofComplete(ctx context.Context, spID int64, periodStart int64, deadline uint64) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
 	var total, completed int
 	err := c.db.QueryRowContext(ctx,
 		`SELECT COUNT(*),
@@ -160,6 +167,8 @@ type WinningPostWin struct {
 // CheckWinningPost checks if the miner has won any blocks since the given epoch.
 // Queries mining_tasks WHERE sp_id=$1 AND won='t' AND epoch > $2.
 func (c *DBClient) CheckWinningPost(ctx context.Context, spID int64, sinceEpoch int64) (*WinningPostWin, error) {
+	ctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
 	var epoch int64
 	var minedCID sql.NullString
 	err := c.db.QueryRowContext(ctx,

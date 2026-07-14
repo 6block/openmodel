@@ -38,6 +38,10 @@ type WindowPostPolicy struct {
 	ResumeDelayAfterCloseSec  int  `yaml:"resume_delay_after_close_sec"`
 	YieldDuringFaultCutoff    bool `yaml:"yield_during_fault_cutoff"`
 	ProofDetectionEnabled     bool `yaml:"proof_detection_enabled"`
+	// How often (in chain epochs) to refresh the full per-deadline sector cache.
+	// Smaller = newly-sealed sectors are detected sooner (so we yield for their
+	// WindowPoSt) at the cost of more Lotus queries. Default 360 (~3h).
+	SectorCacheRefreshEpochs int `yaml:"sector_cache_refresh_epochs"`
 }
 
 type CurioConfig struct {
@@ -61,6 +65,13 @@ type GRPCConfig struct {
 type MetricsConfig struct {
 	Port    int  `yaml:"port"`
 	Enabled bool `yaml:"enabled"`
+	// AuthToken, if set, requires `Authorization: Bearer <token>` on /ready and the
+	// /debug/* endpoints (served on this port). The gateway sends the per-worker
+	// token on its /ready polls; set this to the same value the worker is registered
+	// with. Empty = no auth (only safe on a trusted LAN). /health and /metrics stay
+	// open (local container healthcheck / internal Prometheus scrape — firewall them).
+	// Use `auth_token: ${SCHEDULER_AUTH_TOKEN}` to source it from the environment.
+	AuthToken string `yaml:"auth_token"`
 }
 
 type LoggingConfig struct {
@@ -124,6 +135,10 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Scheduler.WindowPost.ResumeDelayAfterCloseSec == 0 {
 		cfg.Scheduler.WindowPost.ResumeDelayAfterCloseSec = 60
+	}
+	if cfg.Scheduler.WindowPost.SectorCacheRefreshEpochs == 0 {
+		// ~3h. Was a hardcoded 2880 (~24h), too stale for actively-sealing miners.
+		cfg.Scheduler.WindowPost.SectorCacheRefreshEpochs = 360
 	}
 	if cfg.Curio.ProofPollIntervalSec == 0 {
 		cfg.Curio.ProofPollIntervalSec = 5

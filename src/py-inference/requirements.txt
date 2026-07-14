@@ -8,8 +8,12 @@ pyyaml>=6.0
 httpx>=0.27.0
 
 # GPU dependencies (install only on GPU machines)
-vllm>=0.6.0
-torch>=2.1.0
+# vLLM 0.22.1 → torch 2.11 + CUDA 13. Needs the CUDA-13 DEVEL Docker base (nvcc for
+# flashinfer JIT) and a host driver >= 580. Validated on fil-server 2026-07-01.
+# Rollback: vllm==0.17.1 + torch>=2.10.0 (runs on the 570/CUDA-12.8 driver). See
+# docs/vllm-upgrade-eval.md.
+vllm==0.22.1
+torch>=2.11.0
 
 # Dev dependencies
 pytest>=7.0

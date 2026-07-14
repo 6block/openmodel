@@ -81,22 +81,19 @@ func (GpuState) EnumDescriptor() ([]byte, []int) {
 type YieldUrgency int32
 
 const (
-	YieldUrgency_YIELD_URGENCY_NORMAL    YieldUrgency = 0 // Finish current batch, then pause
-	YieldUrgency_YIELD_URGENCY_HIGH      YieldUrgency = 1 // Pause after current request
-	YieldUrgency_YIELD_URGENCY_IMMEDIATE YieldUrgency = 2 // Abort in-flight requests, stop now
+	YieldUrgency_YIELD_URGENCY_NORMAL    YieldUrgency = 0 // Drain in-flight requests (up to 30s), then pause
+	YieldUrgency_YIELD_URGENCY_IMMEDIATE YieldUrgency = 1 // Abort in-flight requests and stop now
 )
 
 // Enum value maps for YieldUrgency.
 var (
 	YieldUrgency_name = map[int32]string{
 		0: "YIELD_URGENCY_NORMAL",
-		1: "YIELD_URGENCY_HIGH",
-		2: "YIELD_URGENCY_IMMEDIATE",
+		1: "YIELD_URGENCY_IMMEDIATE",
 	}
 	YieldUrgency_value = map[string]int32{
 		"YIELD_URGENCY_NORMAL":    0,
-		"YIELD_URGENCY_HIGH":      1,
-		"YIELD_URGENCY_IMMEDIATE": 2,
+		"YIELD_URGENCY_IMMEDIATE": 1,
 	}
 )
 
@@ -487,11 +484,10 @@ const file_sidecar_proto_rawDesc = "" +
 	"\x13GPU_STATE_AVAILABLE\x10\x01\x12\x16\n" +
 	"\x12GPU_STATE_YIELDING\x10\x02\x12\x19\n" +
 	"\x15GPU_STATE_WINDOW_POST\x10\x03\x12\x1a\n" +
-	"\x16GPU_STATE_WINNING_POST\x10\x04*]\n" +
+	"\x16GPU_STATE_WINNING_POST\x10\x04*E\n" +
 	"\fYieldUrgency\x12\x18\n" +
-	"\x14YIELD_URGENCY_NORMAL\x10\x00\x12\x16\n" +
-	"\x12YIELD_URGENCY_HIGH\x10\x01\x12\x1b\n" +
-	"\x17YIELD_URGENCY_IMMEDIATE\x10\x02*\xec\x01\n" +
+	"\x14YIELD_URGENCY_NORMAL\x10\x00\x12\x1b\n" +
+	"\x17YIELD_URGENCY_IMMEDIATE\x10\x01*\xec\x01\n" +
 	"\vYieldReason\x12\x18\n" +
 	"\x14YIELD_REASON_UNKNOWN\x10\x00\x12(\n" +
 	"$YIELD_REASON_WINDOW_POST_APPROACHING\x10\x01\x12#\n" +
@@ -503,7 +499,7 @@ const file_sidecar_proto_rawDesc = "" +
 	"\x10SchedulerService\x12E\n" +
 	"\x0eGetGpuSchedule\x12\x18.sidecar.ScheduleRequest\x1a\x19.sidecar.ScheduleResponse\x12M\n" +
 	"\x17SubscribeScheduleEvents\x12\x18.sidecar.ScheduleRequest\x1a\x16.sidecar.ScheduleEvent0\x01\x12R\n" +
-	"\x15ReportInferenceStatus\x12\x1e.sidecar.InferenceStatusReport\x1a\x19.sidecar.ScheduleResponseB0Z.openmodel/go-scheduler/proto/sidecarb\x06proto3"
+	"\x15ReportInferenceStatus\x12\x1e.sidecar.InferenceStatusReport\x1a\x19.sidecar.ScheduleResponseB&Z$openmodel/go-scheduler/proto/sidecarb\x06proto3"
 
 var (
 	file_sidecar_proto_rawDescOnce sync.Once

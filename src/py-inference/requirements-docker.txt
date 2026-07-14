@@ -7,6 +7,11 @@ uvicorn[standard]>=0.27.0
 pyyaml>=6.0
 httpx>=0.27.0
 
-# vLLM pulls compatible torch version automatically
-vllm==0.17.1
+# vLLM 0.22.1 → torch 2.11 + CUDA 13 (needs the CUDA-13 DEVEL base for nvcc, and a
+# HOST DRIVER >= 580; see the Dockerfile header + docs/vllm-upgrade-eval.md). Validated
+# on fil-server (8x RTX 3080, driver 580.159.03, CUDA 13.0): engine + EnginePool
+# yield/resume + single-GPU + 8-GPU multi-instance all serve correctly (2026-07-01).
+# Rollback: vllm==0.17.1 + the 12.4.1-runtime base (runs on the 570/CUDA-12.8 driver).
+vllm==0.22.1
 transformers
+cryptography>=42.0  # A1 signed receipts (ed25519)

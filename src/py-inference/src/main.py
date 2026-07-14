@@ -109,7 +109,15 @@ async def main():
                        extra={"error": str(e)})
 
     # Create and run API server (pass model_manager for runtime model switching)
-    app = create_app(engine, model_manager=model_manager)
+    app = create_app(
+        engine,
+        model_manager=model_manager,
+        api_token=cfg.inference.api_token,
+        max_tokens_limit=cfg.inference.max_tokens_limit,
+    )
+    if not cfg.inference.api_token:
+        logger.warning("inference API auth is DISABLED — set INFERENCE_API_TOKEN "
+                       "or firewall the inference port (the gateway is the auth layer)")
     config = uvicorn.Config(
         app,
         host="0.0.0.0",

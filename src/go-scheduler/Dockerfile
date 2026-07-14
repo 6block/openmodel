@@ -1,20 +1,17 @@
-FROM golang:1.24-alpine AS builder
-
-RUN apk --no-cache add protobuf protobuf-dev
-RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest \
-    && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-# Regenerate protobuf Go stubs (ensures binary descriptor matches go_package)
-RUN protoc \
-    --go_out=proto/sidecar --go_opt=paths=source_relative \
-    --go-grpc_out=proto/sidecar --go-grpc_opt=paths=source_relative \
-    -I proto proto/sidecar.proto
-RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -o /scheduler cmd/scheduler/main.go
+# Build from the COMMITTED protobuf stubs (proto/sidecar/*.pb.go, kept in sync
+# via scripts/gen-proto.sh). We intentionally do NOT regenerate them in-build:
+# the previous `protoc-gen-go-grpc@latest` is unpinned and drifted to v1.6.2,
+# which requires Go >= 1.25 and breaks this Go-1.24 build. Committed stubs are
+# the source of truth (and are exercised by `go test`), so the build is now
+# reproducible and free of floating tool versions.
+RUN CGO_ENABLED=0 GOOS=linux go build -o /scheduler cmd/scheduler/main.go
 
 FROM alpine:3.19
 RUN apk --no-cache add ca-certificates

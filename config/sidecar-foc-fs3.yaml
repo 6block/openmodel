@@ -1,0 +1,71 @@
+# OpenModel — fil-server3 FOC end-to-end real-download test config
+# Based on sidecar-server3.yaml (miner t0185520, real lotus/curio unchanged);
+# only the inference model id is changed to a brand-new one (forced cache miss → real FOC download), foc switched to the real backend.
+mode: prod
+
+lotus:
+  api_url: "http://localhost:1234/rpc/v0"
+  api_token: "${LOTUS_API_TOKEN}"
+  miner_address: "t0185520"
+  poll_interval_sec: 15
+  connect_timeout_sec: 10
+
+curio:
+  dsn: "host=localhost port=5433 user=yugabyte dbname=yugabyte sslmode=disable search_path=curio"
+  proof_poll_interval_sec: 5
+  proof_max_wait_sec: 1800
+  log_path: "/tmp/curio.log"
+
+scheduler:
+  window_post:
+    graceful_yield_threshold_sec: 300
+    hard_stop_threshold_sec: 120
+    resume_delay_after_close_sec: 60
+    yield_during_fault_cutoff: false
+    proof_detection_enabled: true
+
+  winning_post:
+    enabled: true
+    resume_delay_sec: 30
+    timeout_sec: 35
+
+  fail_safe_on_disconnect: true
+
+grpc:
+  port: 50051
+  max_message_size_mb: 4
+
+inference:
+  engine: "vllm"
+  # Brand-new model_id: cache dir /models/foctest--Qwen2.5-1.5B does not exist → forces a real FOC download
+  model: "foctest/Qwen2.5-1.5B"
+  gpu_memory_utilization: 0.80
+  max_model_len: 4096
+  api_port: 8000
+
+  multi_gpu:
+    mode: "tensor_parallel"
+    gpu_count: 1
+    device_ids: [0]
+
+  multi_instance:
+    load_balancer: "round_robin"
+
+# FOC — real backend, retrieves from a real SP
+foc:
+  backend: "real"
+  real:
+    bridge_url: "http://127.0.0.1:3100"
+    piece_cid_registry:
+      "foctest/Qwen2.5-1.5B":
+        - "bafkzcibfqcaiaoqzo2usg7fuygpbshhavx224bcd7y2kcu6lwxkqsmvxxkaki33ueqgq"
+        - "bafkzcibfqcaiaoqz3aydtkb3uk56bykmojrfmu4jtfapuh3cnwor54lltt5uo2e3smea"
+        - "bafkzcibg7csmj3ibdff5c4ystkttul3w7xahpxtnzon5cjqof7bjpkc6ggk6q3ymm2ubq"
+
+metrics:
+  port: 9090
+  enabled: true
+
+logging:
+  level: "info"
+  format: "text"

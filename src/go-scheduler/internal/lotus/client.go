@@ -161,7 +161,15 @@ func (c *RPCClient) call(ctx context.Context, method string, params []interface{
 	return nil
 }
 
+// lotusCallTimeout bounds each Lotus RPC so a hung (connected-but-unresponsive)
+// daemon triggers the fail-safe within seconds instead of stalling the poll tick up
+// to the 30s HTTP client timeout (audit MEDIUM fix). Context cancellation aborts the
+// in-flight request (call() uses http.NewRequestWithContext).
+const lotusCallTimeout = 5 * time.Second
+
 func (c *RPCClient) GetProvingDeadline(ctx context.Context) (*DeadlineInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, lotusCallTimeout)
+	defer cancel()
 	var info DeadlineInfo
 	err := c.call(ctx, "Filecoin.StateMinerProvingDeadline", []interface{}{c.minerAddress, nil}, &info)
 	if err != nil {
@@ -171,6 +179,8 @@ func (c *RPCClient) GetProvingDeadline(ctx context.Context) (*DeadlineInfo, erro
 }
 
 func (c *RPCClient) GetDeadlineSectors(ctx context.Context, deadlineIdx uint64) (*DeadlineSectors, error) {
+	ctx, cancel := context.WithTimeout(ctx, lotusCallTimeout)
+	defer cancel()
 	var partitions []json.RawMessage
 	err := c.call(ctx, "Filecoin.StateMinerPartitions",
 		[]interface{}{c.minerAddress, deadlineIdx, nil}, &partitions)

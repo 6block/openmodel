@@ -37,13 +37,19 @@ type Scheduler struct {
 	// Proof completion monitoring via Curio DB.
 	proofMonitor       curio.ProofMonitor
 	proofMonitorActive atomic.Bool // true while waiting for proof completion
+	// Monotonic generation for WinningPoSt resume timers. Each new win bumps it;
+	// a timer only resumes if its generation is still current, so an earlier
+	// timer cannot resume during a later, still-active win (fixes double-timer race).
+	winningGen atomic.Int64
 	proofWaitCfg       curio.WaitConfig
 	minerID            int64 // sp_id numeric (e.g., 182063 for t0182063)
 
 	// Track completed proofs to prevent re-yielding for the same deadline.
-	completedProofMu       sync.RWMutex
-	completedProofPeriod   int64
-	completedProofDeadline uint64
+	// A set keyed by (periodStart, deadline) — a single proving period can have
+	// several deadlines with sectors, so a single-slot tracker would forget the
+	// earlier ones. Bounded in size; an occasional re-yield after a reset is safe.
+	completedProofMu sync.RWMutex
+	completedProofs  map[proofKey]bool
 
 	// Curio log watcher for fast WinningPoSt detection.
 	curioLogWatcher *curio.LogWatcher
@@ -51,6 +57,13 @@ type Scheduler struct {
 	// Optional callback fired on every state transition.
 	// Used by health package to update Prometheus metrics without import cycles.
 	onStateChange func(state pb.GpuState, reason pb.YieldReason)
+
+	// Retry cadence for the WinningPoSt monitor's initial epoch fetch
+	// (overridable in tests). Defaults to 5s.
+	initRetryInterval time.Duration
+
+	// When > 0, overrides the WinningPoSt resume delay (tests use a small value).
+	winningResumeDelay time.Duration
 }
 
 // SetOnStateChange registers a callback that fires whenever the GPU state
@@ -62,11 +75,12 @@ func (s *Scheduler) SetOnStateChange(cb func(state pb.GpuState, reason pb.YieldR
 // New creates a new Scheduler.
 func New(lotusClient lotus.Client, policy YieldPolicy, logger *slog.Logger) *Scheduler {
 	return &Scheduler{
-		lotus:       lotusClient,
-		policy:      policy,
-		sm:          NewStateMachine(),
-		logger:      logger,
-		subscribers: make(map[int]chan *pb.ScheduleEvent),
+		lotus:             lotusClient,
+		policy:            policy,
+		sm:                NewStateMachine(),
+		logger:            logger,
+		subscribers:       make(map[int]chan *pb.ScheduleEvent),
+		initRetryInterval: 5 * time.Second,
 	}
 }
 
@@ -129,7 +143,15 @@ func (s *Scheduler) pollWindowPost(ctx context.Context, interval time.Duration) 
 	}
 }
 
-const sectorCacheRefreshInterval = 2880
+// sectorCacheRefreshInterval returns how many epochs the per-deadline sector
+// cache stays valid before a full refresh. Configurable via policy; defaults to
+// 2880 (~24h) only if unset (e.g. zero-value policy in tests).
+func (s *Scheduler) sectorCacheRefreshInterval() int64 {
+	if s.policy.WindowPost.SectorCacheRefreshEpochs > 0 {
+		return int64(s.policy.WindowPost.SectorCacheRefreshEpochs)
+	}
+	return 2880
+}
 
 func (s *Scheduler) checkWindowPost(ctx context.Context) {
 	// If proof monitor is actively waiting, skip WindowPoSt evaluation
@@ -182,7 +204,7 @@ func (s *Scheduler) checkWindowPost(ctx context.Context) {
 			Reason:  pb.YieldReason_YIELD_REASON_RESUME,
 			Message: "no deadlines with sectors",
 		}
-		s.applyDecision(&decision)
+		s.applyDecisionUnlessWinning(&decision)
 		return
 	}
 
@@ -253,12 +275,12 @@ func (s *Scheduler) evaluateAndApply(ctx context.Context, info *lotus.DeadlineIn
 			Reason:  pb.YieldReason_YIELD_REASON_RESUME,
 			Message: "proof already completed for this deadline, staying available",
 		}
-		s.applyDecision(&decision)
+		s.applyDecisionUnlessWinning(&decision)
 		return
 	}
 
 	prevState := s.sm.Current()
-	s.applyDecision(&decision)
+	s.applyDecisionUnlessWinning(&decision)
 
 	// If we just transitioned INTO WindowPost and proof monitor is configured,
 	// launch background proof completion detection.
@@ -323,7 +345,7 @@ func (s *Scheduler) refreshFullSectorCache(ctx context.Context, info *lotus.Dead
 	}
 
 	// Only refresh if cache is stale or incomplete
-	stale := (info.CurrentEpoch - cacheEpoch) > sectorCacheRefreshInterval
+	stale := (info.CurrentEpoch - cacheEpoch) > s.sectorCacheRefreshInterval()
 	incomplete := uint64(cacheLen) < numDeadlines
 	if !stale && !incomplete {
 		return
@@ -408,20 +430,37 @@ func (s *Scheduler) waitForProofAndResume(ctx context.Context, info *lotus.Deadl
 		Reason:  pb.YieldReason_YIELD_REASON_RESUME,
 		Message: "proof complete, GPU available for inference",
 	}
-	s.applyDecision(&resume)
+	// Do NOT clobber an active WINNING_POST: if a block-production window is in
+	// progress, the WinningPoSt resume timer (which re-arms while a proof is active)
+	// owns the final resume. We've recorded the proof as complete above, and our
+	// deferred proofMonitorActive=false lets that timer proceed.
+	s.applyDecisionUnlessWinning(&resume)
+}
+
+// proofKey identifies a completed WindowPoSt proof by proving period + deadline.
+type proofKey struct {
+	period   int64
+	deadline uint64
 }
 
 func (s *Scheduler) markProofCompleted(periodStart int64, deadline uint64) {
 	s.completedProofMu.Lock()
 	defer s.completedProofMu.Unlock()
-	s.completedProofPeriod = periodStart
-	s.completedProofDeadline = deadline
+	if s.completedProofs == nil {
+		s.completedProofs = make(map[proofKey]bool)
+	}
+	// Bound memory: an occasional re-yield after a reset is harmless (yielding is
+	// always safe; the set is only an optimization to avoid redundant yields).
+	if len(s.completedProofs) > 128 {
+		s.completedProofs = make(map[proofKey]bool)
+	}
+	s.completedProofs[proofKey{period: periodStart, deadline: deadline}] = true
 }
 
 func (s *Scheduler) isProofAlreadyCompleted(periodStart int64, deadline uint64) bool {
 	s.completedProofMu.RLock()
 	defer s.completedProofMu.RUnlock()
-	return s.completedProofPeriod == periodStart && s.completedProofDeadline == deadline
+	return s.completedProofs[proofKey{period: periodStart, deadline: deadline}]
 }
 
 func (s *Scheduler) deadlineHasNoSectors(ctx context.Context, info *lotus.DeadlineInfo) bool {
@@ -430,7 +469,7 @@ func (s *Scheduler) deadlineHasNoSectors(ctx context.Context, info *lotus.Deadli
 	cacheEpoch := s.sectorCacheEpoch
 	s.sectorCacheMu.RUnlock()
 
-	needsRefresh := !cached || (info.CurrentEpoch-cacheEpoch) > sectorCacheRefreshInterval
+	needsRefresh := !cached || (info.CurrentEpoch-cacheEpoch) > s.sectorCacheRefreshInterval()
 	if needsRefresh {
 		ds, err := s.lotus.GetDeadlineSectors(ctx, info.Index)
 		if err != nil {
@@ -467,13 +506,23 @@ func (s *Scheduler) monitorWinningPost(ctx context.Context) {
 		return
 	}
 
-	// Start DB polling fallback
-	info, err := s.lotus.GetProvingDeadline(ctx)
-	if err != nil {
-		s.logger.Error("failed to get initial epoch for WinningPoSt monitor", "error", err)
-		return
+	// Establish the starting epoch. A transient Lotus failure at startup must
+	// NOT permanently disable WinningPoSt detection (which would silently lose
+	// block rewards) — retry until Lotus answers or the context is cancelled.
+	var lastCheckedEpoch int64
+	for {
+		info, err := s.lotus.GetProvingDeadline(ctx)
+		if err == nil {
+			lastCheckedEpoch = info.CurrentEpoch
+			break
+		}
+		s.logger.Warn("WinningPoSt monitor: initial epoch fetch failed, retrying", "error", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(s.initRetryInterval):
+		}
 	}
-	lastCheckedEpoch := info.CurrentEpoch
 
 	// Start log watcher (primary, fastest detection)
 	var logWinCh <-chan struct{}
@@ -546,27 +595,52 @@ func (s *Scheduler) triggerWinningYield(ctx context.Context, message string) {
 	}
 	s.applyDecision(&decision)
 
+	// Claim a generation for this win. A later win bumps the generation, so this
+	// timer becomes stale and must NOT resume (the later win's timer owns resume).
+	gen := s.winningGen.Add(1)
+
+	resumeDelay := time.Duration(s.policy.WinningPost.ResumeDelaySec) * time.Second
+	if s.winningResumeDelay > 0 {
+		resumeDelay = s.winningResumeDelay
+	}
+
 	go func() {
-		timer := time.NewTimer(time.Duration(s.policy.WinningPost.ResumeDelaySec) * time.Second)
+		timer := time.NewTimer(resumeDelay)
 		defer timer.Stop()
 
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-			// If WindowPoSt proof is still being computed, don't resume —
-			// let the proof monitor handle resume when proof is done.
-			if s.proofMonitorActive.Load() {
-				s.logger.Info("WinningPoSt timer expired but WindowPoSt proof still active, deferring resume to proof monitor")
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				// A newer WinningPoSt occurred — its window is still active and its
+				// own timer will handle resume. Resuming now could put inference on
+				// the GPU during block production.
+				if s.winningGen.Load() != gen {
+					s.logger.Info("WinningPoSt resume timer superseded by a newer win, skipping resume",
+						"timer_gen", gen, "current_gen", s.winningGen.Load())
+					return
+				}
+				// A WindowPoSt proof is still being computed — the GPU must stay
+				// yielded. Re-arm and check again rather than abandoning resume:
+				// the proof monitor no longer resumes on its own while WINNING_POST
+				// is active (it would clobber it), so THIS timer owns the final
+				// resume once the proof finishes. Bounded by the proof monitor's
+				// own MaxWait, after which proofMonitorActive clears.
+				if s.proofMonitorActive.Load() {
+					s.logger.Info("WinningPoSt window elapsed but WindowPoSt proof still active; re-arming resume check")
+					timer.Reset(resumeDelay)
+					continue
+				}
+				resume := YieldDecision{
+					State:   StateAvailable,
+					Urgency: pb.YieldUrgency_YIELD_URGENCY_NORMAL,
+					Reason:  pb.YieldReason_YIELD_REASON_RESUME,
+					Message: "WinningPoSt complete, GPU available for inference",
+				}
+				s.applyDecision(&resume)
 				return
 			}
-			resume := YieldDecision{
-				State:   StateAvailable,
-				Urgency: pb.YieldUrgency_YIELD_URGENCY_NORMAL,
-				Reason:  pb.YieldReason_YIELD_REASON_RESUME,
-				Message: "WinningPoSt complete, GPU available for inference",
-			}
-			s.applyDecision(&resume)
 		}
 	}()
 }
@@ -588,6 +662,52 @@ func (s *Scheduler) applyDecision(decision *YieldDecision) {
 		if s.onStateChange != nil {
 			s.onStateChange(decision.State, decision.Reason)
 		}
+	}
+}
+
+// applyDecisionUnlessWinning applies a decision only if the GPU is NOT currently in
+// WINNING_POST. Used by the WindowPoSt evaluation and the proof-monitor resume so
+// they can never clobber an in-progress block-production yield — the check-and-set
+// is atomic in the state machine, closing the TOCTOU window between checkWindowPost's
+// slow Lotus call and a concurrent WinningPoSt win (audit HIGH fix).
+//
+// A SAME-STATE no-op (e.g. AVAILABLE→AVAILABLE, which is what every 15s poll produces
+// for a worker in steady service) still REFRESHES latestDecision — without the
+// broadcast/onStateChange side effects. B1's /ready seconds_until_change is served
+// from latestDecision; before this refresh existed the countdown froze at whatever
+// value accompanied the last real state change (a resume decision carries none → the
+// field read 0 for hours) and the gateway's predictive de-prioritization never saw a
+// live countdown while the worker was servable — exactly when it matters.
+func (s *Scheduler) applyDecisionUnlessWinning(decision *YieldDecision) {
+	if !s.sm.TransitionUnless(decision.State, StateWinningPost) {
+		if s.sm.Current() == StateWinningPost {
+			// Blocked to protect block production: keep the WINNING_POST decision intact.
+			if decision.State != StateWinningPost {
+				s.logger.Info("skipped GPU state change to protect active WINNING_POST",
+					"attempted_state", decision.State.String(), "reason", decision.Reason.String())
+			}
+			return
+		}
+		// Same-state no-op: refresh the decision (keeps the B1 countdown live) but do
+		// not log/broadcast — nothing changed for subscribers. A win landing between
+		// the two checks above at worst leaves a stale decision for one WinningPoSt
+		// window (≤30s); the resume path writes unconditionally and self-heals it.
+		s.decMu.Lock()
+		s.latestDecision = decision
+		s.decMu.Unlock()
+		return
+	}
+	s.decMu.Lock()
+	s.latestDecision = decision
+	s.decMu.Unlock()
+	s.logger.Info("GPU state changed",
+		"state", decision.State.String(),
+		"reason", decision.Reason.String(),
+		"message", decision.Message,
+	)
+	s.broadcastEvent(decision)
+	if s.onStateChange != nil {
+		s.onStateChange(decision.State, decision.Reason)
 	}
 }
 
@@ -645,6 +765,15 @@ func (s *Scheduler) LatestDecision() *YieldDecision {
 	s.decMu.RLock()
 	defer s.decMu.RUnlock()
 	return s.latestDecision
+}
+
+// SetLatestDecisionForTest injects a decision so tests can exercise the gRPC handler
+// and event-broadcast paths (e.g. forward-compat enum passthrough) without driving
+// the full polling loop. Test-only seam; not used in production.
+func (s *Scheduler) SetLatestDecisionForTest(d *YieldDecision) {
+	s.decMu.Lock()
+	defer s.decMu.Unlock()
+	s.latestDecision = d
 }
 
 // SectorCacheSnapshot returns a copy of the current sector cache for debugging.

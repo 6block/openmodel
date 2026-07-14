@@ -33,6 +33,12 @@ class InferenceConfig:
     api_port: int = 8000
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    # Optional bearer token protecting /v1/* endpoints (from INFERENCE_API_TOKEN
+    # env or yaml). Empty = auth disabled (the M2 gateway is the auth layer; the
+    # inference port should be firewalled in that case).
+    api_token: str = ""
+    # Reject requests asking for more than this many output tokens (0 = no cap).
+    max_tokens_limit: int = 0
     multi_gpu: MultiGpuConfig = field(default_factory=MultiGpuConfig)
     multi_instance: MultiInstanceConfig = field(default_factory=MultiInstanceConfig)
 
@@ -179,6 +185,8 @@ def load_config(path: str | Path) -> AppConfig:
         api_port=inference_raw.get("api_port", 8000),
         tensor_parallel_size=tp_size,
         enforce_eager=inference_raw.get("enforce_eager", False),
+        api_token=os.environ.get("INFERENCE_API_TOKEN", inference_raw.get("api_token", "")),
+        max_tokens_limit=inference_raw.get("max_tokens_limit", 0),
         multi_gpu=multi_gpu,
         multi_instance=MultiInstanceConfig(
             load_balancer=mi_raw.get("load_balancer", "round_robin"),

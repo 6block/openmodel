@@ -1,4 +1,10 @@
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+# vLLM 0.22.1 (CUDA 13 / torch 2.11) — requires the DEVEL base (ships nvcc) because
+# flashinfer JIT-compiles sampling/attention kernels at runtime; a *-runtime base has
+# no nvcc and the engine fails to init. Also requires a HOST DRIVER >= 580 (CUDA 13.0);
+# on driver 570 (CUDA 12.8) this image builds but the engine cannot initialize CUDA.
+# To roll back to vLLM 0.17.1: use `nvidia/cuda:12.4.1-runtime-ubuntu22.04` + vllm==0.17.1
+# (that variant needs no nvcc and runs on the 570 driver). See docs/vllm-upgrade-eval.md.
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 

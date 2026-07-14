@@ -37,7 +37,7 @@ services:
       - HF_ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}
       - HF_TOKEN=${HF_TOKEN:-}
       - HF_HOME=/root/.cache/huggingface
-      - MODEL_CACHE_DIR=/models
+      - MODEL_CACHE_DIR=/models   # in-container path (shared with foc-bridge)
     volumes:
       - ./config:/etc/sidecar:ro
       - ${MODEL_CACHE_DIR:-~/openmodel/models}:/models

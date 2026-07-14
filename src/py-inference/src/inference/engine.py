@@ -11,6 +11,14 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+# Max seconds to wait for the NEXT token from the engine core before treating a request as
+# stalled (dead/wedged core) and failing it fast with a retryable error — instead of
+# hanging until the client's own timeout. A live engine streams tokens continuously, so a
+# gap this long means the core is gone. Soak finding: a SIGKILL'd EngineCore left in-flight
+# requests hanging ~120s until the client timed out, giving the gateway no chance to retry
+# (0.009% of requests, only under a hard crash). Tunable via env for slow-first-token setups.
+_GEN_STALL_TIMEOUT = float(os.environ.get("GEN_STALL_TIMEOUT_SEC", "60"))
+
 
 class YieldUrgency(enum.IntEnum):
     NORMAL = 0      # Drain all in-flight requests (up to 30s), then pause
@@ -25,6 +33,8 @@ class EngineState(enum.Enum):
     PAUSED = "paused"         # Engine destroyed, VRAM released
     LOADING = "loading"       # Recreating engine + loading model
     STOPPING = "stopping"
+    DEAD = "dead"             # Engine core crashed (EngineDeadError) — excluded
+                              # from routing until automatic recovery reloads it
 
 
 @dataclass
@@ -34,6 +44,7 @@ class GenerateResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     finish_reason: str = "stop"  # "stop" or "length"
+    cached_tokens: int = 0       # Prompt tokens served from vLLM's prefix cache
 
 
 @dataclass
@@ -43,6 +54,28 @@ class StreamChunk:
     finish_reason: str | None = None  # Set only on the last chunk
     prompt_tokens: int = 0       # Set only on the last chunk
     completion_tokens: int = 0   # Set only on the last chunk
+    cached_tokens: int = 0       # Set only on the last chunk (prefix-cache hits)
+
+
+def _extract_cached_tokens(request_output, prompt_tokens: int) -> int:
+    """Prompt tokens served from vLLM's automatic prefix cache for this request.
+
+    vLLM exposes this as RequestOutput.num_cached_tokens (0.17.x). Returns 0 if
+    the attribute is absent (older vLLM) or invalid, and never reports more than
+    the prompt length. Used downstream to bill cache hits at the cache-read rate.
+    """
+    n = getattr(request_output, "num_cached_tokens", None)
+    if n is None:
+        return 0
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return 0
+    if n < 0:
+        return 0
+    if prompt_tokens and n > prompt_tokens:
+        return prompt_tokens
+    return n
 
 
 @dataclass
@@ -125,17 +158,67 @@ class VLLMEngine(InferenceEngine):
         self._pending_pause: YieldUrgency | None = None
         self._pending_resume: bool = False
 
+        # PIDs of THIS engine's vLLM core subprocesses, recorded as the
+        # active_children() delta around _create_engine. _destroy_engine must
+        # only ever kill these — in multi_instance mode all engines share one
+        # parent process, so scanning active_children() at destroy time (the
+        # old behavior) collected EVERY engine's core and SIGKILLed siblings.
+        # That is exactly what crashed healthy engines during a per-engine
+        # model switch (soak finding: EngineDeadError storm after switching).
+        self._child_pids: set[int] = set()
+        # False while a model switch drains this engine: routing skips it but
+        # in-flight requests run to completion instead of being aborted.
+        self._accepting: bool = True
+        # Guards against scheduling more than one dead-engine recovery task.
+        self._recovering: bool = False
+
+    # Serializes CUDA_VISIBLE_DEVICES set + subprocess spawn + child-pid delta
+    # across ALL engines in this process (class-level), so concurrent creates
+    # can neither race on the env var nor mis-attribute each other's children.
+    _create_lock: asyncio.Lock | None = None
+
+    @classmethod
+    def _creation_lock(cls) -> asyncio.Lock:
+        if cls._create_lock is None:
+            cls._create_lock = asyncio.Lock()
+        return cls._create_lock
+
     async def _create_engine(self) -> None:
-        """Create and initialize the vLLM AsyncLLMEngine."""
+        """Create and initialize the vLLM AsyncLLMEngine.
+
+        Runs under the class-wide creation lock: setting the process-level
+        CUDA_VISIBLE_DEVICES, spawning the core subprocess, and attributing the
+        new child PIDs to THIS engine must be atomic across all engines.
+        """
+        import multiprocessing
+
+        async with VLLMEngine._creation_lock():
+            # Snapshot pre-existing children so the post-create delta contains
+            # only the subprocesses spawned by THIS engine.
+            try:
+                pre_existing = {c.pid for c in multiprocessing.active_children()}
+            except Exception:
+                pre_existing = set()
+
+            # Set CUDA_VISIBLE_DEVICES every time (not just on start),
+            # so that resume also targets the correct GPU.
+            if self._device_ids is not None:
+                cuda_devices = ",".join(str(d) for d in self._device_ids)
+                os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
+                logger.info("set CUDA_VISIBLE_DEVICES=%s", cuda_devices)
+            await self._create_engine_inner()
+
+            try:
+                self._child_pids = {c.pid for c in multiprocessing.active_children()} - pre_existing
+                logger.info("engine subprocesses for devices %s: %s",
+                            self._device_ids, self._child_pids)
+            except Exception:
+                self._child_pids = set()
+
+    async def _create_engine_inner(self) -> None:
+        """The actual vLLM engine construction (called under the creation lock)."""
         from vllm import AsyncLLMEngine
         from vllm.engine.arg_utils import AsyncEngineArgs
-
-        # Set CUDA_VISIBLE_DEVICES every time (not just on start),
-        # so that resume also targets the correct GPU.
-        if self._device_ids is not None:
-            cuda_devices = ",".join(str(d) for d in self._device_ids)
-            os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
-            logger.info("set CUDA_VISIBLE_DEVICES=%s", cuda_devices)
 
         # Auto-adapt max_model_len: if model's max_position_embeddings is smaller
         # than configured max_model_len, use the model's limit instead.
@@ -158,6 +241,7 @@ class VLLMEngine(InferenceEngine):
             tensor_parallel_size=self._tensor_parallel_size,
             trust_remote_code=True,
             enforce_eager=self._enforce_eager,
+            enable_prefix_caching=True,  # report num_cached_tokens for cache-read billing (V1 default; set explicitly to be deterministic)
         )
         self._engine = AsyncLLMEngine.from_engine_args(args)
 
@@ -177,16 +261,14 @@ class VLLMEngine(InferenceEngine):
                     pass  # Best-effort abort
             self._inflight_request_ids.clear()
 
-            # Collect child PIDs before shutdown (vLLM v1 spawns subprocesses)
-            import multiprocessing
-            child_pids = set()
-            try:
-                parent_pid = os.getpid()
-                for child in multiprocessing.active_children():
-                    child_pids.add(child.pid)
-                logger.info("vLLM child processes before shutdown: %s", child_pids)
-            except Exception:
-                pass
+            # Kill ONLY this engine's own core subprocesses (recorded at create
+            # time). Never scan multiprocessing.active_children() here: in
+            # multi_instance mode all engines share one parent process, so the
+            # old scan collected every sibling engine's core and SIGKILLed
+            # healthy engines during a per-engine model switch (soak finding:
+            # EngineDeadError storm, ~1/8 requests surviving).
+            child_pids = set(self._child_pids)
+            logger.info("this engine's vLLM subprocesses before shutdown: %s", child_pids)
 
             # Shutdown the engine
             if hasattr(self._engine, 'shutdown'):
@@ -213,6 +295,7 @@ class VLLMEngine(InferenceEngine):
                         logger.debug("could not kill pid %d: %s", pid, e)
                 # Wait for killed processes to release resources
                 await asyncio.sleep(1)
+            self._child_pids.clear()
 
         # Force CUDA memory release
         try:
@@ -274,11 +357,27 @@ class VLLMEngine(InferenceEngine):
         needed_ratio = self._gpu_memory_utilization
         deadline = time.monotonic() + timeout
 
+        # A transient nvidia-smi failure must NOT cause us to immediately proceed
+        # and recreate the engine while the GPU is still occupied (old subprocess
+        # not yet released, or mining still winding down) — that risks OOM or
+        # landing on a mining GPU. Keep polling on failures. Only if nvidia-smi
+        # NEVER works (e.g. not installed in dev/mock) do we give up and proceed.
+        smi_ever_worked = False
+        consecutive_failures = 0
         while time.monotonic() < deadline:
             free_ratio = self._query_gpu_free_ratio(gpu_id)
             if free_ratio is None:
-                logger.debug("nvidia-smi query failed for GPU %d, skipping wait", gpu_id)
-                return
+                consecutive_failures += 1
+                if not smi_ever_worked and consecutive_failures >= 3:
+                    logger.warning("nvidia-smi unavailable for GPU %d — cannot verify VRAM, proceeding", gpu_id)
+                    return
+                logger.debug("nvidia-smi query failed for GPU %d (%d), retrying",
+                             gpu_id, consecutive_failures)
+                await asyncio.sleep(0.5)
+                continue
+
+            smi_ever_worked = True
+            consecutive_failures = 0
             if free_ratio >= needed_ratio:
                 logger.info("GPU %d VRAM released: %.1f%% free (need %.0f%%)",
                             gpu_id, free_ratio * 100, needed_ratio * 100)
@@ -361,7 +460,9 @@ class VLLMEngine(InferenceEngine):
         os._exit(1)
 
     async def start(self, model_path: str) -> None:
-        self._state = EngineState.STARTING
+        async with self._transition_lock:
+            self._state = EngineState.STARTING
+            self._accepting = True  # clear any leftover drain gate
 
         logger.info("starting vLLM engine: model=%s, tp=%d, devices=%s",
                      model_path, self._tensor_parallel_size, self._device_ids)
@@ -369,20 +470,38 @@ class VLLMEngine(InferenceEngine):
         try:
             self._model = model_path
             await self._create_engine()
-            self._state = EngineState.RUNNING
-            logger.info("vLLM engine started: model=%s", model_path)
         except Exception as e:
-            self._state = EngineState.STOPPED
+            async with self._transition_lock:
+                self._state = EngineState.STOPPED
+                # Drop any pause queued during the failed start — nothing loaded.
+                self._pending_pause = None
             logger.error("failed to start vLLM: %s", e)
             raise
 
+        # A yield may have arrived while we were loading (state == STARTING).
+        # Honor it now instead of coming up RUNNING and holding the GPU during
+        # mining (fixes pause-dropped-during-STARTING).
+        async with self._transition_lock:
+            if self._pending_pause is not None:
+                urgency = self._pending_pause
+                self._pending_pause = None
+                logger.info("pending pause detected after start, unloading immediately (urgency=%s)",
+                             urgency.name)
+                await self._destroy_engine()
+                self._state = EngineState.PAUSED
+                logger.info("vLLM engine paused right after start — GPU VRAM released")
+            else:
+                self._state = EngineState.RUNNING
+                logger.info("vLLM engine started: model=%s", model_path)
+
     async def pause(self, urgency: YieldUrgency = YieldUrgency.NORMAL) -> None:
         async with self._transition_lock:
-            if self._state == EngineState.LOADING:
-                # Model is being loaded — flag it, will unload after load completes
+            if self._state in (EngineState.LOADING, EngineState.STARTING):
+                # Model is being loaded (resume) or first-started — flag it; the
+                # loader (start()/_do_reload()) unloads after the load completes.
                 self._pending_pause = urgency
-                logger.info("pause requested during LOADING (urgency=%s), will unload after load",
-                             urgency.name)
+                logger.info("pause requested during %s (urgency=%s), will unload after load",
+                             self._state.value, urgency.name)
                 return
 
             if self._state != EngineState.RUNNING:
@@ -390,15 +509,32 @@ class VLLMEngine(InferenceEngine):
 
             logger.info("pausing vLLM engine (urgency=%s, inflight=%d) — will release GPU VRAM",
                          urgency.name, self._active_requests)
-            self._state = EngineState.UNLOADING
+            if urgency == YieldUrgency.NORMAL:
+                # Soft yield: refuse NEW requests but stay RUNNING through the
+                # drain so in-flight generations truly run to completion. The
+                # old code flipped to UNLOADING first, which made every
+                # in-flight request abort itself on its next token — the
+                # documented "NORMAL = drain 30s" never actually drained.
+                self._accepting = False
+            else:
+                # Immediate yield (WinningPoSt): abort in-flight right now.
+                self._state = EngineState.UNLOADING
 
-        # Outside lock: drain or skip based on urgency
         if urgency == YieldUrgency.NORMAL:
             await self._drain_requests(timeout=30)
+            async with self._transition_lock:
+                if self._state != EngineState.RUNNING:
+                    # An immediate pause / stop took over mid-drain — it owns
+                    # the rest of the teardown.
+                    return
+                self._state = EngineState.UNLOADING
 
         # Destroy engine and release VRAM
         async with self._transition_lock:
             await self._destroy_engine()
+            # Availability stays gated by state until resume; re-arm accepting
+            # so the engine serves again once it is RUNNING.
+            self._accepting = True
 
             if self._pending_resume:
                 # Resume was requested while we were unloading — reload immediately
@@ -421,6 +557,14 @@ class VLLMEngine(InferenceEngine):
                 logger.info("resume requested during UNLOADING, will reload after unload")
                 return
 
+            if self._state == EngineState.DEAD:
+                # Core crashed and a recovery task is already reloading it. Don't
+                # silently no-op (the listener would treat resume as done and
+                # never retry) — the recovery path brings the engine back to
+                # RUNNING on its own, so just note it and let it finish.
+                logger.warning("resume requested while engine DEAD — recovery already in progress, will come up RUNNING")
+                return
+
             if self._state != EngineState.PAUSED:
                 return
 
@@ -437,39 +581,97 @@ class VLLMEngine(InferenceEngine):
             self._state = EngineState.STOPPED
 
     async def switch_model(self, new_model_path: str) -> None:
-        """Switch to a different model by destroying and recreating the engine."""
+        """Switch to a different model by destroying and recreating the engine.
+
+        Unlike a mining yield, a model switch is not urgent: stop ACCEPTING new
+        requests on this engine (the pool routes around it) but let in-flight
+        requests run to completion BEFORE tearing the engine down. The old
+        behavior paused immediately, which aborted in-flight work mid-token
+        under load (soak finding: switching while serving crashed cores)."""
         if self._model == new_model_path and self._state == EngineState.RUNNING:
             return  # Already loaded
 
         old_model = self._model
         logger.info("switching model: %s -> %s", old_model, new_model_path)
 
-        # Pause to destroy current engine and release VRAM
-        await self.pause(YieldUrgency.NORMAL)
-
-        # Update model path
-        self._model = new_model_path
-
-        # Resume to create new engine with new model
+        self._accepting = False
         try:
-            await self.resume()
-            logger.info("model switch complete: %s -> %s", old_model, new_model_path)
-        except Exception as e:
-            logger.error("model switch failed, rolling back to %s: %s", old_model, e)
-            self._model = old_model
+            # Drain while still RUNNING: the mid-generation state check stays
+            # green, so requests genuinely complete instead of self-aborting.
+            await self._drain_requests(timeout=30)
+
+            # Pause to destroy current engine and release VRAM
+            await self.pause(YieldUrgency.NORMAL)
+
+            # Update model path
+            self._model = new_model_path
+
+            # Resume to create new engine with new model
             try:
                 await self.resume()
-                logger.info("rollback successful, restored: %s", old_model)
-            except Exception as rollback_err:
-                logger.error("rollback also failed: %s", rollback_err)
-            raise
+                logger.info("model switch complete: %s -> %s", old_model, new_model_path)
+            except Exception as e:
+                logger.error("model switch failed, rolling back to %s: %s", old_model, e)
+                self._model = old_model
+                try:
+                    await self.resume()
+                    logger.info("rollback successful, restored: %s", old_model)
+                except Exception as rollback_err:
+                    logger.error("rollback also failed: %s", rollback_err)
+                raise
+        finally:
+            self._accepting = True
 
     @property
     def current_model(self) -> str:
         return self._model
 
     def is_available(self) -> bool:
-        return self._state == EngineState.RUNNING
+        # _accepting goes False while a model switch drains this engine:
+        # no NEW requests are routed here, but in-flight ones finish normally.
+        return self._state == EngineState.RUNNING and self._accepting
+
+    @staticmethod
+    def _is_engine_dead_error(e: BaseException) -> bool:
+        """Detect vLLM's EngineDeadError without a hard import dependency
+        (the class lives in vllm.v1.engine.exceptions; mock/test envs lack it)."""
+        return "enginedead" in type(e).__name__.lower()
+
+    def _mark_dead(self, err: BaseException) -> None:
+        """The engine core subprocess crashed. Take this engine out of routing
+        and schedule one automatic recovery (destroy remnants + reload model).
+
+        Without this, /health kept reporting the engine as running and the
+        pool kept routing requests into the dead core — every one failed with
+        a 500 until the container was manually restarted (soak finding)."""
+        logger.critical(
+            "vLLM engine core died (devices=%s, model=%s): %s — "
+            "marking engine DEAD and scheduling automatic recovery",
+            self._device_ids, self._model, err)
+        self._state = EngineState.DEAD
+        if not self._recovering:
+            self._recovering = True
+            asyncio.get_running_loop().create_task(self._recover_dead_engine())
+
+    async def _recover_dead_engine(self) -> None:
+        """Background recovery: reap the dead core, then reload the model.
+        _do_reload retries 3× and falls back to process exit (container
+        restart) if the CUDA context is unrecoverable — same policy as resume."""
+        try:
+            logger.info("recovering dead engine (devices=%s, model=%s)",
+                        self._device_ids, self._model)
+            async with self._transition_lock:
+                if self._state != EngineState.DEAD:
+                    return  # someone else already transitioned us
+                await self._destroy_engine()
+                self._state = EngineState.LOADING
+            await self._do_reload()
+            logger.info("dead engine recovered (devices=%s)", self._device_ids)
+        except Exception as e:
+            logger.error("dead-engine recovery failed (devices=%s): %s",
+                         self._device_ids, e)
+        finally:
+            self._recovering = False
 
     def status(self) -> EngineStatus:
         gpu_id = self._device_ids[0] if self._device_ids and len(self._device_ids) == 1 else -1
@@ -479,6 +681,31 @@ class VLLMEngine(InferenceEngine):
             loaded_model=self._model,
             gpu_id=gpu_id,
         )
+
+    async def _iter_outputs(self, results_generator, request_id: str):
+        """Iterate a vLLM result generator, bounding each await so a wedged or dead engine
+        core can't hang the request until the client's own timeout. If no token arrives
+        within _GEN_STALL_TIMEOUT, abort the request and raise a RuntimeError, which the API
+        layer maps to a retryable 503 so the gateway fails over to another worker (soak
+        finding: a SIGKILL'd EngineCore left in-flight requests hanging instead of fast-
+        failing). A genuine EngineDeadError still propagates and is handled by the callers."""
+        aiter = results_generator.__aiter__()
+        while True:
+            try:
+                out = await asyncio.wait_for(aiter.__anext__(), timeout=_GEN_STALL_TIMEOUT)
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                try:
+                    await self._engine.abort(request_id)
+                except Exception:
+                    pass
+                logger.warning("request %s stalled — no output for %.0fs, failing fast (dead/wedged core)",
+                               request_id, _GEN_STALL_TIMEOUT)
+                raise RuntimeError(
+                    "engine stalled — no output; request failed, retry on another worker"
+                )
+            yield out
 
     async def generate(self, prompt: str, **kwargs) -> str:
         if not self.is_available():
@@ -507,7 +734,7 @@ class VLLMEngine(InferenceEngine):
         try:
             results_generator = self._engine.generate(prompt, sampling_params, request_id)
             final_output = None
-            async for request_output in results_generator:
+            async for request_output in self._iter_outputs(results_generator, request_id):
                 # Check if we got paused mid-generation
                 if self._state != EngineState.RUNNING:
                     if self._engine is not None:
@@ -526,6 +753,7 @@ class VLLMEngine(InferenceEngine):
             output_text = output.text
             prompt_tokens = len(final_output.prompt_token_ids) if hasattr(final_output, 'prompt_token_ids') and final_output.prompt_token_ids else 0
             completion_tokens = len(output.token_ids) if hasattr(output, 'token_ids') and output.token_ids else 0
+            cached_tokens = _extract_cached_tokens(final_output, prompt_tokens)
 
             # Map vLLM's finish reason to OpenAI format
             finish_reason = "stop"
@@ -539,7 +767,18 @@ class VLLMEngine(InferenceEngine):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 finish_reason=finish_reason,
+                cached_tokens=cached_tokens,
             )
+        except Exception as e:
+            if self._is_engine_dead_error(e):
+                # Core subprocess crashed: take the engine out of routing and
+                # surface a RuntimeError, which the API layer maps to 503
+                # (retryable) instead of the unhandled-500 this used to be.
+                self._mark_dead(e)
+                raise RuntimeError(
+                    "engine core died — request failed, retry on another worker"
+                ) from e
+            raise
         finally:
             self._active_requests -= 1
             self._inflight_request_ids.discard(request_id)
@@ -577,7 +816,7 @@ class VLLMEngine(InferenceEngine):
         try:
             results_generator = self._engine.generate(prompt, sampling_params, request_id)
             final_output = None
-            async for request_output in results_generator:
+            async for request_output in self._iter_outputs(results_generator, request_id):
                 if self._state != EngineState.RUNNING:
                     if self._engine is not None:
                         try:
@@ -600,6 +839,7 @@ class VLLMEngine(InferenceEngine):
             output = final_output.outputs[0]
             prompt_tokens = len(final_output.prompt_token_ids) if hasattr(final_output, 'prompt_token_ids') and final_output.prompt_token_ids else 0
             completion_tokens = len(output.token_ids) if hasattr(output, 'token_ids') and output.token_ids else 0
+            cached_tokens = _extract_cached_tokens(final_output, prompt_tokens)
 
             finish_reason = "stop"
             if hasattr(output, 'finish_reason') and output.finish_reason:
@@ -612,7 +852,15 @@ class VLLMEngine(InferenceEngine):
                 finish_reason=finish_reason,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
             )
+        except Exception as e:
+            if self._is_engine_dead_error(e):
+                self._mark_dead(e)
+                raise RuntimeError(
+                    "engine core died — request failed, retry on another worker"
+                ) from e
+            raise
         finally:
             self._active_requests -= 1
             self._inflight_request_ids.discard(request_id)

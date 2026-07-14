@@ -2,7 +2,7 @@
 
 import logging
 import shutil
-import subprocess
+import tarfile
 import tempfile
 from pathlib import Path
 
@@ -14,6 +14,29 @@ logger = logging.getLogger(__name__)
 
 # 30 minutes timeout for large model downloads on testnet
 DOWNLOAD_TIMEOUT = 1800.0
+
+
+def _safe_extractall(tf: tarfile.TarFile, dest: Path) -> None:
+    """Extract every member into dest, refusing any that would escape it via path
+    traversal ('..' / absolute paths) or symlinks pointing outside (audit MEDIUM fix:
+    the model tar comes from a third-party SP and `tar -xzf` follows symlinks). Prefers
+    the stdlib 'data' filter (Python 3.12+); falls back to a manual guard."""
+    try:
+        tf.extractall(dest, filter="data")
+        return
+    except TypeError:
+        pass  # Python < 3.12: no filter kwarg
+    dest_resolved = str(dest.resolve())
+    prefix = dest_resolved.rstrip("/") + "/"
+    for m in tf.getmembers():
+        target = (dest / m.name).resolve()
+        if str(target) != dest_resolved and not str(target).startswith(prefix):
+            raise RuntimeError(f"unsafe tar member escapes destination: {m.name}")
+        if m.issym() or m.islnk():
+            link = (target.parent / m.linkname).resolve()
+            if not str(link).startswith(prefix):
+                raise RuntimeError(f"unsafe tar link escapes destination: {m.name} -> {m.linkname}")
+    tf.extractall(dest)
 
 
 class RealFOCClient(FOCClient):
@@ -33,9 +56,19 @@ class RealFOCClient(FOCClient):
                 e.g., {"Qwen/Qwen2.5-1.5B-Instruct": ["cid1", "cid2", "cid3"]}
         """
         self._bridge_url = bridge_url.rstrip('/')
-        # Normalize registry: always store as list
+        # Normalize registry: always store CIDs as a list. A model entry may be a bare
+        # CID / list of CIDs (legacy), OR a dict {"cids": [...], "sha256": "<64hex>"}.
+        # The sha256 (A2) is the pinned digest of the assembled weights tarball — the
+        # bridge verifies it and refuses to keep a tampered download.
         self._registry: dict[str, list[str]] = {}
-        for model_id, cids in piece_cid_registry.items():
+        self._sha256: dict[str, str] = {}
+        for model_id, entry in piece_cid_registry.items():
+            if isinstance(entry, dict):
+                cids = entry.get("cids", [])
+                if entry.get("sha256"):
+                    self._sha256[model_id] = str(entry["sha256"]).lower()
+            else:
+                cids = entry
             if isinstance(cids, str):
                 self._registry[model_id] = [cids]
             else:
@@ -99,7 +132,7 @@ class RealFOCClient(FOCClient):
         return ModelManifest(
             model_id=model_id,
             size_bytes=0,  # Will be known after download
-            checksum_sha256="",  # FOC uses PieceCID for integrity
+            checksum_sha256=self._sha256.get(model_id, ""),  # A2: pinned tarball digest
             source_uri=",".join(cids),  # All CIDs joined
             quantization=None,
         )
@@ -124,11 +157,22 @@ class RealFOCClient(FOCClient):
         tmp_path = str(tmp_dir / f"foc-model-{manifest.model_id.replace('/', '-')}.tar.gz")
 
         try:
-            # Request multi-part download — bridge writes directly to disk
-            resp = await self._client.post(
-                f"{self._bridge_url}/download-model",
-                json={"pieceCids": cids, "destPath": tmp_path},
-            )
+            # Request multi-part download — bridge writes directly to disk and,
+            # when a digest is pinned (A2), verifies it before returning (deleting a
+            # tampered file). An UNPINNED model is logged as unverified downstream.
+            payload = {"pieceCids": cids, "destPath": tmp_path}
+            if manifest.checksum_sha256:
+                payload["sha256"] = manifest.checksum_sha256
+            else:
+                logger.warning("model %s has NO pinned sha256 — weights unverified (pin it in "
+                               "piece_cid_registry as {cids, sha256} for supply-chain safety)",
+                               manifest.model_id)
+            resp = await self._client.post(f"{self._bridge_url}/download-model", json=payload)
+            if resp.status_code == 422:
+                body = resp.json()
+                logger.error("WEIGHT INTEGRITY FAILURE for %s: %s", manifest.model_id, body.get("error"))
+                raise RuntimeError(f"weight integrity check failed for {manifest.model_id}: "
+                                   f"expected {body.get('expected')}, got {body.get('computed')}")
             resp.raise_for_status()
             result = resp.json()
 
@@ -140,23 +184,28 @@ class RealFOCClient(FOCClient):
             logger.info("download complete: %.1f MB in %.1fs (%d parts)",
                         size_mb, elapsed, result.get("parts", 0))
 
-            # Extract tar.gz to dest
-            dest.mkdir(parents=True, exist_ok=True)
+            # Extract SAFELY to a temp dir, then atomically swap into place. A crash
+            # mid-extract therefore never leaves a half-populated cache dir that a
+            # later run would mistake for a complete model (audit MEDIUM fix).
+            extract_tmp = dest.parent / (dest.name + ".extracting")
+            shutil.rmtree(extract_tmp, ignore_errors=True)
+            extract_tmp.mkdir(parents=True, exist_ok=True)
             logger.info("extracting model to %s", dest)
-            subprocess.run(
-                ["tar", "-xzf", tmp_path, "-C", str(dest)],
-                check=True,
-                capture_output=True,
-            )
+            with tarfile.open(tmp_path, "r:gz") as tf:
+                _safe_extractall(tf, extract_tmp)
+            shutil.rmtree(dest, ignore_errors=True)
+            extract_tmp.rename(dest)
 
             logger.info("model extracted successfully: %s -> %s", manifest.model_id, dest)
             return dest
 
         except httpx.HTTPStatusError as e:
             logger.error("FOC download failed (HTTP %d): %s", e.response.status_code, e)
+            self._cleanup_partial(dest)
             raise
         except Exception as e:
             logger.error("FOC download error: %s", e)
+            self._cleanup_partial(dest)
             raise
         finally:
             # Clean up tar.gz
@@ -164,3 +213,10 @@ class RealFOCClient(FOCClient):
                 Path(tmp_path).unlink(missing_ok=True)
             except Exception:
                 pass
+
+    @staticmethod
+    def _cleanup_partial(dest: Path) -> None:
+        """Remove partial extraction artifacts so a failed download never leaves an
+        incomplete model dir that a later run would mistake for a valid cache."""
+        shutil.rmtree(dest.parent / (dest.name + ".extracting"), ignore_errors=True)
+        shutil.rmtree(dest, ignore_errors=True)

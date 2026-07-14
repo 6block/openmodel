@@ -86,6 +86,12 @@ func (h *Handler) SubscribeScheduleEvents(req *pb.ScheduleRequest, stream pb.Sch
 
 // ReportInferenceStatus receives status reports from the Python inference service.
 func (h *Handler) ReportInferenceStatus(ctx context.Context, report *pb.InferenceStatusReport) (*pb.ScheduleResponse, error) {
+	// Guard against a nil/empty message (a decode glitch or a misbehaving client
+	// sending an empty frame): dereferencing it would panic the RPC and could take
+	// down the scheduler. Treat nil as an empty report.
+	if report == nil {
+		report = &pb.InferenceStatusReport{}
+	}
 	h.logger.Debug("inference status report",
 		"running", report.IsRunning,
 		"active_requests", report.ActiveRequests,

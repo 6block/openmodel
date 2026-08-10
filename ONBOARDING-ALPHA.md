@@ -386,7 +386,7 @@ container logs.
 |---|---|
 | Gateway | https://36.189.235.195:18020 |
 | gateway_id | openmodel-mainnet |
-| Settlement contract (Filecoin mainnet) | 0x465d979675d401295C529e15dC9187c9b92ed4d1 |
+| Settlement contract (Filecoin mainnet) | 0x60D41baEaBe1ABE061AE82c44425debc35bA524A |
 | Settlement tokens | FIL, USDFC |
 | Admission floor | power ≥ 1 TiB, miner balance ≥ 1 FIL |
 | CA fingerprint (SHA256) | 49:1A:4F:DF:F7:6C:A2:56:7C:D3:15:0F:71:CE:C6:B9:C3:18:63:75:09:9E:B4:8C:1A:5E:2C:51:C7:4A:1F:73 |

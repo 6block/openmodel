@@ -30,9 +30,10 @@ sys.modules.setdefault("src.scheduler_client.grpc_client", _grpc_stub)
 
 class FakeSchedule:
     """Stand-in for the gRPC ScheduleResponse used by the listener."""
-    def __init__(self, state: int, message: str = ""):
+    def __init__(self, state: int, message: str = "", gateway_auth_token: str = ""):
         self.state = state
         self.message = message
+        self.gateway_auth_token = gateway_auth_token
 
 
 class FakeSchedulerClient:
@@ -41,6 +42,7 @@ class FakeSchedulerClient:
         self._state = 1  # AVAILABLE
         self.raise_on_get = False
         self.reported = []  # status reports captured (P5)
+        self.gateway_auth_token = ""  # advertised self-registration token
 
     def set_state(self, state: int):
         self._state = state
@@ -48,7 +50,7 @@ class FakeSchedulerClient:
     def get_gpu_schedule(self):
         if self.raise_on_get:
             raise ConnectionError("scheduler unreachable")
-        return FakeSchedule(self._state)
+        return FakeSchedule(self._state, gateway_auth_token=self.gateway_auth_token)
 
     def report_status(self, **kwargs):
         self.reported.append(kwargs)

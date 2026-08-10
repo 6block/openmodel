@@ -23,4 +23,3 @@ func TestSectorCacheRefreshIntervalConfigurable(t *testing.T) {
 		t.Fatalf("expected fallback 2880, got %d", got)
 	}
 }
-

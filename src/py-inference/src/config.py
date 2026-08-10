@@ -54,6 +54,16 @@ class FOCConfig:
 
 
 @dataclass
+class GatewayConfig:
+    """Subset of the sidecar's gateway: block that the inference side cares
+    about. The scheduler owns registration; inference only needs the claimed
+    model list so it can prefetch weights BEFORE a switch request arrives —
+    otherwise the first request for a claimed-but-absent model stalls on a
+    multi-minute download and times out."""
+    supported_models: list = field(default_factory=list)
+
+
+@dataclass
 class GRPCConfig:
     scheduler_addr: str = "localhost:50051"
 
@@ -69,6 +79,7 @@ class AppConfig:
     mode: str = "dev"
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     foc: FOCConfig = field(default_factory=FOCConfig)
+    gateway: GatewayConfig = field(default_factory=GatewayConfig)
     grpc: GRPCConfig = field(default_factory=GRPCConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
@@ -202,6 +213,14 @@ def load_config(path: str | Path) -> AppConfig:
         simulate_delay=mock_raw.get("simulate_delay", False),
         real_bridge_url=real_raw.get("bridge_url", "http://127.0.0.1:3100"),
         real_piece_cid_registry=real_raw.get("piece_cid_registry", {}),
+    )
+
+    gateway_raw = raw.get("gateway") or {}
+    supported = gateway_raw.get("supported_models") or []
+    if not isinstance(supported, list):
+        supported = []
+    cfg.gateway = GatewayConfig(
+        supported_models=[str(m) for m in supported if m],
     )
 
     grpc_raw = raw.get("grpc", {})

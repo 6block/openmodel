@@ -58,24 +58,24 @@ func (m *MockClient) GetProvingDeadline(ctx context.Context) (*DeadlineInfo, err
 
 	// If past current deadline, advance to next one (48 deadlines per period)
 	if m.currentEpoch >= m.deadlineClose {
-		period := int64(120)  // shortened for dev testing (~60 min cycle)
-		window := int64(60)   // 30 minutes = 60 epochs
+		period := int64(120) // shortened for dev testing (~60 min cycle)
+		window := int64(60)  // 30 minutes = 60 epochs
 		m.deadlineOpen = m.deadlineClose + period - window
 		m.deadlineClose = m.deadlineOpen + window
 		m.deadlineIndex = (m.deadlineIndex + 1) % 48
 	}
 
 	return &DeadlineInfo{
-		CurrentEpoch:          m.currentEpoch,
-		PeriodStart:           m.deadlineOpen - int64(m.deadlineIndex)*60,
-		Index:                 m.deadlineIndex,
-		Open:                  m.deadlineOpen,
-		Close:                 m.deadlineClose,
-		Challenge:             m.deadlineOpen,
-		FaultCutoff:           m.deadlineOpen - 70,
-		WPoStPeriodDeadlines:  48,
-		WPoStProvingPeriod:    2880,
-		WPoStChallengeWindow:  60,
+		CurrentEpoch:           m.currentEpoch,
+		PeriodStart:            m.deadlineOpen - int64(m.deadlineIndex)*60,
+		Index:                  m.deadlineIndex,
+		Open:                   m.deadlineOpen,
+		Close:                  m.deadlineClose,
+		Challenge:              m.deadlineOpen,
+		FaultCutoff:            m.deadlineOpen - 70,
+		WPoStPeriodDeadlines:   48,
+		WPoStProvingPeriod:     2880,
+		WPoStChallengeWindow:   60,
 		WPoStChallengeLookback: 20,
 	}, nil
 }

@@ -1,6 +1,7 @@
 """Real FOC client that retrieves models from Filecoin Onchain Cloud via the foc-bridge."""
 
 import logging
+import os
 import shutil
 import tarfile
 import tempfile
@@ -12,8 +13,12 @@ from .foc_client import FOCClient, ModelManifest
 
 logger = logging.getLogger(__name__)
 
-# 30 minutes timeout for large model downloads on testnet
-DOWNLOAD_TIMEOUT = 1800.0
+# The bridge answers only when the whole multi-GB download is done, so this read
+# timeout is effectively a cap on total download time. 30 minutes was one: on a
+# ~1.5 MB/s link a 6.1 GB model needs ~68 min, so the client gave up on a healthy
+# download, crashed, restarted, and collided with its own still-running fetch —
+# an endless loop that never produced weights. Budget for slow SP links.
+DOWNLOAD_TIMEOUT = float(os.environ.get("FOC_DOWNLOAD_TIMEOUT_SEC", 6 * 3600))
 
 
 def _safe_extractall(tf: tarfile.TarFile, dest: Path) -> None:
@@ -84,9 +89,29 @@ class RealFOCClient(FOCClient):
                      extra={"bridge_url": bridge_url,
                             "registered_models": list(self._registry.keys())})
 
+    def _registry_key(self, model_id: str) -> str | None:
+        """Resolve model_id to a registry key, tolerating the two spellings a
+        model travels under: the HF id ("Org/Name") and the local weight path
+        ("/models/Org--Name"). Fleet-wide, claims and switch requests use the
+        path form while registries are naturally keyed by HF id — an exact-only
+        lookup made every path-form claim invisible to FOC (found live: the
+        prefetch of a claimed path-form model reported "unavailable" although
+        its CIDs were registered under the HF id)."""
+        if model_id in self._registry:
+            return model_id
+        base = model_id.rstrip("/").rsplit("/", 1)[-1]
+        for cand in (base, base.replace("--", "/", 1)):
+            if cand in self._registry:
+                return cand
+        alt = "/models/" + model_id.replace("/", "--")
+        if alt in self._registry:
+            return alt
+        return None
+
     def _get_cids(self, model_id: str) -> list[str] | None:
         """Look up the PieceCIDs for a model_id from the registry."""
-        return self._registry.get(model_id)
+        key = self._registry_key(model_id)
+        return self._registry.get(key) if key else None
 
     async def check_availability(self, model_id: str) -> bool:
         """Check if a model is available on FOC by resolving its first PieceCID."""
@@ -132,7 +157,10 @@ class RealFOCClient(FOCClient):
         return ModelManifest(
             model_id=model_id,
             size_bytes=0,  # Will be known after download
-            checksum_sha256=self._sha256.get(model_id, ""),  # A2: pinned tarball digest
+            # Pinned tarball digest — resolved through the same key tolerance as
+            # the CID lookup, or a path-form claim would silently skip the
+            # integrity gate its HF-keyed entry pins.
+            checksum_sha256=self._sha256.get(self._registry_key(model_id) or model_id, ""),
             source_uri=",".join(cids),  # All CIDs joined
             quantization=None,
         )

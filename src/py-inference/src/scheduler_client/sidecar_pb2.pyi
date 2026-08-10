@@ -16,7 +16,6 @@ class GpuState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
 class YieldUrgency(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     YIELD_URGENCY_NORMAL: _ClassVar[YieldUrgency]
-    YIELD_URGENCY_HIGH: _ClassVar[YieldUrgency]
     YIELD_URGENCY_IMMEDIATE: _ClassVar[YieldUrgency]
 
 class YieldReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
@@ -34,7 +33,6 @@ GPU_STATE_YIELDING: GpuState
 GPU_STATE_WINDOW_POST: GpuState
 GPU_STATE_WINNING_POST: GpuState
 YIELD_URGENCY_NORMAL: YieldUrgency
-YIELD_URGENCY_HIGH: YieldUrgency
 YIELD_URGENCY_IMMEDIATE: YieldUrgency
 YIELD_REASON_UNKNOWN: YieldReason
 YIELD_REASON_WINDOW_POST_APPROACHING: YieldReason
@@ -81,11 +79,13 @@ class ScheduleRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class ScheduleResponse(_message.Message):
-    __slots__ = ("current_state", "seconds_until_next_change", "message")
+    __slots__ = ("current_state", "seconds_until_next_change", "message", "gateway_auth_token")
     CURRENT_STATE_FIELD_NUMBER: _ClassVar[int]
     SECONDS_UNTIL_NEXT_CHANGE_FIELD_NUMBER: _ClassVar[int]
     MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    GATEWAY_AUTH_TOKEN_FIELD_NUMBER: _ClassVar[int]
     current_state: GpuState
     seconds_until_next_change: int
     message: str
-    def __init__(self, current_state: _Optional[_Union[GpuState, str]] = ..., seconds_until_next_change: _Optional[int] = ..., message: _Optional[str] = ...) -> None: ...
+    gateway_auth_token: str
+    def __init__(self, current_state: _Optional[_Union[GpuState, str]] = ..., seconds_until_next_change: _Optional[int] = ..., message: _Optional[str] = ..., gateway_auth_token: _Optional[str] = ...) -> None: ...

@@ -20,6 +20,42 @@ from .receipt import build_receipt, get_signer
 logger = logging.getLogger(__name__)
 
 
+_tokenizers: dict = {}
+
+
+def _chat_prompt(engine, messages):
+    """Render the conversation with the model's own chat template.
+
+    The bare "role: content" join below it is kept only for models that ship no
+    template. Feeding that bare transcript to an instruction-tuned model makes
+    it treat the input as text to continue — it completes the user's sentence
+    and invents its own turn markers. Qwen2.5 masked this by answering anyway;
+    Qwen3 additionally exposes its raw <think> block, so the web user saw
+    template noise plus the model's internal reasoning.
+    """
+    path = getattr(engine, "current_model", "") or ""
+    tok = _tokenizers.get(path)
+    if tok is None and path:
+        try:
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+        except Exception:
+            logger.warning("no tokenizer loadable for %s; falling back to bare prompt", path)
+            tok = False  # negative-cache: do not retry on every request
+        _tokenizers[path] = tok
+    if tok and getattr(tok, "chat_template", None):
+        return tok.apply_chat_template(
+            [{"role": m.role, "content": m.content} for m in messages],
+            tokenize=False,
+            add_generation_prompt=True,
+            # Reasoning models default to a <think> block. The minimal web UI
+            # renders it verbatim and it multiplies answer latency, so serve
+            # direct answers; templates without this variable ignore it.
+            enable_thinking=False,
+        )
+    return "\n".join(f"{m.role}: {m.content}" for m in messages)
+
+
 def _engine_session_key(http_request, messages=None, prompt=None):
     """Derive an engine-affinity key so a multi-instance worker can route the
     same conversation back to the same engine (reusing its prefix cache).
@@ -137,7 +173,8 @@ def _retry_after_for_state(state: EngineState) -> str:
 
 
 def create_app(engine: InferenceEngine, model_manager=None,
-               api_token: str = "", max_tokens_limit: int = 0) -> FastAPI:
+               api_token: str = "", max_tokens_limit: int = 0,
+               token_store=None) -> FastAPI:
     """Create the FastAPI application with the given inference engine.
 
     Args:
@@ -148,6 +185,10 @@ def create_app(engine: InferenceEngine, model_manager=None,
         api_token: If non-empty, /v1/* endpoints require
             'Authorization: Bearer <api_token>'. /health stays open.
         max_tokens_limit: If > 0, reject requests asking for more output tokens.
+        token_store: Optional GatewayTokenStore of dynamic per-worker tokens
+            issued by SP self-registration (learned from the scheduler over
+            gRPC). Accepted IN ADDITION to api_token; auth is enforced as soon
+            as either source is configured.
     """
     app = FastAPI(title="OpenModel Inference API")
 
@@ -155,13 +196,23 @@ def create_app(engine: InferenceEngine, model_manager=None,
     _model_switch_lock = asyncio.Lock()
 
     def _require_auth(authorization: str = Header(default="")):
-        """Bearer-token gate for /v1/* endpoints (no-op when api_token unset)."""
-        if not api_token:
+        """Bearer-token gate for /v1/* endpoints.
+
+        No-op only when NEITHER a static api_token NOR a dynamic token store is
+        configured (trusted-LAN mode). With self-registration, the accepted set
+        is {static token} ∪ {last two dynamic tokens} — the previous dynamic
+        token stays valid for one rotation so in-flight gateway requests don't
+        401 during the ≤3s handover.
+        """
+        dynamic = token_store.accepted() if token_store is not None else []
+        if not api_token and not dynamic:
             return
-        expected = f"Bearer {api_token}"
-        # constant-time compare; reject anything not exactly "Bearer <token>"
-        if not hmac.compare_digest(authorization, expected):
-            raise HTTPException(status_code=401, detail="invalid or missing Authorization")
+        candidates = ([api_token] if api_token else []) + dynamic
+        for tok in candidates:
+            # constant-time compare; reject anything not exactly "Bearer <token>"
+            if hmac.compare_digest(authorization, f"Bearer {tok}"):
+                return
+        raise HTTPException(status_code=401, detail="invalid or missing Authorization")
 
     def _check_max_tokens(max_tokens: int):
         if max_tokens_limit > 0 and max_tokens > max_tokens_limit:
@@ -273,9 +324,7 @@ def create_app(engine: InferenceEngine, model_manager=None,
                 headers={"Retry-After": _retry_after_for_state(status.state)},
             )
 
-        prompt = "\n".join(
-            f"{msg.role}: {msg.content}" for msg in request.messages
-        )
+        prompt = _chat_prompt(engine, request.messages)
         # B2 stream resume: continue EXACTLY from the text a previous worker already
         # delivered — vLLM generates the sequel of the prompt string, so appending the
         # delivered prefix verbatim (no separator) resumes mid-sentence seamlessly.

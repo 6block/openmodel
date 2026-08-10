@@ -15,8 +15,8 @@ import (
 
 // flakyLotus fails GetProvingDeadline the first `failN` times, then succeeds.
 type flakyLotus struct {
-	failN  int32
-	calls  atomic.Int32
+	failN int32
+	calls atomic.Int32
 }
 
 func (f *flakyLotus) GetProvingDeadline(ctx context.Context) (*lotus.DeadlineInfo, error) {

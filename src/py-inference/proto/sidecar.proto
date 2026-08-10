@@ -58,6 +58,12 @@ message ScheduleResponse {
   GpuState current_state = 1;
   int64 seconds_until_next_change = 2;
   string message = 3;
+  // Per-worker gateway auth token obtained by SP self-registration. The
+  // inference service merges it into its accepted Bearer tokens so the gateway
+  // can authenticate immediately after a (re-)registration rotates the token.
+  // Empty when self-registration is disabled (older schedulers simply never
+  // set it — proto3 default keeps this backward compatible).
+  string gateway_auth_token = 4;
 }
 
 // The scheduler service running in the Go component.

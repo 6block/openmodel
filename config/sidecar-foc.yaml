@@ -6,7 +6,7 @@ mode: prod
 lotus:
   api_url: "ws://localhost:1234/rpc/v0"
   api_token: "${LOTUS_API_TOKEN}"
-  miner_address: "t0182063"
+  miner_address: ""            # <<< miner id, e.g. t01234 / f01234
   poll_interval_sec: 15
   connect_timeout_sec: 10
 
@@ -61,6 +61,14 @@ foc:
   real:
     bridge_url: "http://127.0.0.1:3100"
     piece_cid_registry:
+      "Qwen/Qwen3-4B-Instruct-2507":   # 6.1GB, 7 parts, dual-SP (providers 4 & 9), uploaded 2026-08-03
+        - "bafkzcibfqcaiaoqzovl27pzr2b4vuioigr42ulv7xfs2p4jiban5wfyp7mg7lacdryqq"
+        - "bafkzcibfqcaiaoqzqdlg352mlrtytqjhr2dmmwnbv3aojkhrwmzjq5ysli7wticfhina"
+        - "bafkzcibfqcaiaoqza5qqjwbwdplg2566t5qzbarkqjobgh5tenn44o6qvy5nnuyica5a"
+        - "bafkzcibfqcaiaoqzgtfmvdkdscqz7cz3zjtkrjjdg4cq5x45wxqxdava23gy6475vyra"
+        - "bafkzcibfqcaiaoqzv5jtkrkhqyin2rkbmgsnbmwhhpiu7polegxpep23keiedc3bcmsq"
+        - "bafkzcibfqcaiaoqz3utakge3p3o5b2lxclaax4csc3steqitkfxmh5ccle4fa6ptyejq"
+        - "bafkzcibgrpx33hibdgy37vscsyx43plvrdotr5fgs6exdnmepk6kc5zhycr5mckxgiqd6"
       "Qwen/Qwen2.5-1.5B-Instruct":
         - "bafkzcibfqcaiaoqzo2usg7fuygpbshhavx224bcd7y2kcu6lwxkqsmvxxkaki33ueqgq"
         - "bafkzcibfqcaiaoqz3aydtkb3uk56bykmojrfmu4jtfapuh3cnwor54lltt5uo2e3smea"
@@ -74,3 +82,31 @@ metrics:
 logging:
   level: "info"
   format: "text"
+
+# --- Join a gateway: SP self-registration ---
+# Uncomment and fill in to have the scheduler register this worker with a
+# gateway on start-up, proving miner control by signing the gateway's challenge
+# with the miner's key from the LOCAL Lotus wallet.
+# Prerequisite: the miner's worker or owner key is in this host's wallet
+# (`lotus wallet list`). See README "Join a gateway (self-registration)".
+# gateway:
+#   url: https://<gateway-host>:<port>            # https strongly recommended over public networks
+#   gateway_id: <gateway-id>                      # must equal the id the gateway advertises (signed; blocks cross-gateway replay); also the gateway's TLS identity
+#   payout_address: "0xYourEvmAddress"            # EVM address earnings settle to (inside the signed message)
+#   public_endpoint: https://<your-ip>:38443      # this worker's inference TLS front, as reachable FROM the gateway
+#   public_scheduler_url: https://<your-ip>:39443 # this scheduler's TLS front, for gateway status polls
+#   auto_register: true                           # false = only manual trigger via -register-only
+#   # worker_id: sp-<your-miner-id>               # optional; defaults to "sp-" + miner address
+#   # gpu_count: 8                                # optional; corrected from live engine count after the first poll
+#   supported_models:              # production catalog v1 — claim what you can serve;
+#     - "/models/Qwen--Qwen3-4B-Instruct-2507"   # qwen3-4b   fp16  ~8G   (1x24G, or TP=2 on 10G cards)
+#     - "/models/Qwen--Qwen3-8B"                 # qwen3-8b   fp16  ~16G  (1x24G, or TP=4 on 10G cards)
+#     - "/models/openai--gpt-oss-20b"            # gpt-oss-20b mxfp4 ~13G
+#     - "/models/Qwen--Qwen3-32B-AWQ"            # qwen3-32b  awq   ~19G  (flagship; TP on 10G cards)
+#   token_path: /data/gateway-token.json          # issued token persists here (0600); mount a writable volume
+#   # tls_ca_path: /data/gateway-ca.crt           # first https registration only; afterwards the cert-store CA is trusted
+#   mtls_front:                                   # certificate-at-registration + built-in mutual-TLS fronts
+#     enabled: true                               #   CSR goes with registration; short-lived cert auto-renews at half-life
+#     # cert_dir: /data/mtls                      #   certificate persistence dir (default; same /data volume)
+#     inference_port: 38443              #   TLS front ports; public_endpoint must point at these (defaults: 8443/9443)
+#     scheduler_port: 39443

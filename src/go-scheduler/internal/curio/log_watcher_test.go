@@ -46,7 +46,7 @@ func TestLogWatcherDetectsWin(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	appendLine(t, logPath, "2026-06-03 some unrelated log line")            // ignored
+	appendLine(t, logPath, "2026-06-03 some unrelated log line")             // ignored
 	appendLine(t, logPath, "2026-06-03 WinPostTask won election deadline=5") // matched
 	expectSignal(t, ch, 3*time.Second, "expected detection of 'WinPostTask won election'")
 }

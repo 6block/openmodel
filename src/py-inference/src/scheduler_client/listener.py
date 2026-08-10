@@ -61,10 +61,15 @@ class SchedulerListener:
 
     def __init__(self, client: SchedulerClient, engine: InferenceEngine,
                  main_loop: asyncio.AbstractEventLoop,
-                 poll_interval: float = 3.0):
+                 poll_interval: float = 3.0,
+                 token_store=None):
         self._client = client
         self._engine = engine
         self._main_loop = main_loop
+        # Optional GatewayTokenStore: each successful poll feeds it the token
+        # the scheduler advertises (SP self-registration), so the API server
+        # accepts the gateway's Bearer within one poll of a rotation.
+        self._token_store = token_store
         self._running = False
         self._thread = None
         self._poll_interval = poll_interval
@@ -138,6 +143,10 @@ class SchedulerListener:
                 else:
                     logger.error("fail-safe pause failed — will retry on next poll")
             return
+
+        # Learn the (possibly rotated) gateway auth token from the scheduler.
+        if self._token_store is not None:
+            self._token_store.update(schedule.gateway_auth_token)
 
         # Connection restored
         if not self._connected:

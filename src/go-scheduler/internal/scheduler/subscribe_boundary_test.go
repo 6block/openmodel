@@ -23,7 +23,7 @@ func newSchedForSubTest() *Scheduler {
 func TestSubscriberIsolationSlowConsumer(t *testing.T) {
 	s := newSchedForSubTest()
 
-	_, slowCh := s.Subscribe()  // never drained → buffer fills
+	_, slowCh := s.Subscribe() // never drained → buffer fills
 	idFast, fastCh := s.Subscribe()
 	_ = slowCh
 

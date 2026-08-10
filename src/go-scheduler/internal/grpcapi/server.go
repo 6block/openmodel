@@ -12,8 +12,16 @@ import (
 // Handler implements the gRPC SchedulerService.
 type Handler struct {
 	pb.UnimplementedSchedulerServiceServer
-	sched  *scheduler.Scheduler
-	logger *slog.Logger
+	sched   *scheduler.Scheduler
+	logger  *slog.Logger
+	tokenFn func() string // optional: gateway auth token from SP self-registration
+}
+
+// SetGatewayTokenProvider wires the SP self-registration token source; the token
+// rides on every GetGpuSchedule response so the inference service can accept the
+// gateway's Bearer within one poll interval of a rotation.
+func (h *Handler) SetGatewayTokenProvider(f func() string) {
+	h.tokenFn = f
 }
 
 // NewHandler creates a new gRPC handler.
@@ -36,6 +44,9 @@ func (h *Handler) GetGpuSchedule(ctx context.Context, req *pb.ScheduleRequest) (
 	if decision != nil {
 		resp.SecondsUntilNextChange = decision.SecondsUntilNextChange
 		resp.Message = decision.Message
+	}
+	if h.tokenFn != nil {
+		resp.GatewayAuthToken = h.tokenFn()
 	}
 
 	return resp, nil

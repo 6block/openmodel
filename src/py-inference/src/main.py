@@ -15,6 +15,7 @@ from .model.foc_mock import create_foc_client
 from .model.manager import ModelManager
 from .scheduler_client.grpc_client import SchedulerClient
 from .scheduler_client.listener import SchedulerListener
+from .scheduler_client.token_store import GatewayTokenStore
 
 
 def setup_logging(level: str, fmt: str):
@@ -97,16 +98,40 @@ async def main():
         await engine.start_paused(model_path)
         logger.info("engine paused at startup (mining active), will load on resume")
 
+    # Dynamic gateway tokens (SP self-registration): the listener learns the
+    # current per-worker token from the scheduler and the API server accepts it
+    # alongside the static INFERENCE_API_TOKEN.
+    token_store = GatewayTokenStore()
+
     # Start scheduler listener (handles yield/resume going forward)
     try:
         if scheduler_client._stub:
             main_loop = asyncio.get_running_loop()
-            listener = SchedulerListener(scheduler_client, engine, main_loop=main_loop)
+            listener = SchedulerListener(scheduler_client, engine, main_loop=main_loop,
+                                         token_store=token_store)
             listener.start()
             logger.info("scheduler listener started")
     except Exception as e:
         logger.warning("could not start scheduler listener",
                        extra={"error": str(e)})
+
+    # Prefetch weights for every claimed model, in the background. Without this,
+    # the download happens inside the first request-triggered switch — and that
+    # request (admission probe: 120s; gateway: 300s) times out long before a
+    # multi-minute download completes. Disk-only; never touches the engine.
+    prefetch_task = None
+    if cfg.gateway.supported_models:
+        async def _prefetch_claimed():
+            models = list(dict.fromkeys(cfg.gateway.supported_models))
+            logger.info("prefetch: ensuring weights for %d claimed models", len(models))
+            for m in models:
+                try:
+                    result = await model_manager.prefetch(m)
+                    logger.info("prefetch %s: %s", m, result)
+                except Exception as e:  # one bad entry must not kill the rest
+                    logger.warning("prefetch %s failed: %s", m, e)
+            logger.info("prefetch: done")
+        prefetch_task = asyncio.create_task(_prefetch_claimed())
 
     # Create and run API server (pass model_manager for runtime model switching)
     app = create_app(
@@ -114,15 +139,25 @@ async def main():
         model_manager=model_manager,
         api_token=cfg.inference.api_token,
         max_tokens_limit=cfg.inference.max_tokens_limit,
+        token_store=token_store,
     )
     if not cfg.inference.api_token:
-        logger.warning("inference API auth is DISABLED — set INFERENCE_API_TOKEN "
-                       "or firewall the inference port (the gateway is the auth layer)")
+        logger.warning("inference API auth has no static token — set INFERENCE_API_TOKEN "
+                       "or rely on scheduler-delivered self-registration tokens; "
+                       "otherwise firewall the inference port (the gateway is the auth layer)")
     config = uvicorn.Config(
         app,
         host="0.0.0.0",
         port=cfg.inference.api_port,
         log_level=cfg.logging.level,
+        # MUST exceed the gateway's idle-connection timeout. uvicorn's default is 5s,
+        # while the gateway pools idle connections far longer — so any second request
+        # arriving in that gap was written into a socket this side had already closed.
+        # The gateway then waited for response headers that could never come and failed
+        # the request only at its full request timeout (5 min on mainnet), with no trace
+        # here: no access log, no engine activity, GPUs idle. Keep this comfortably
+        # above the gateway value so the client is always the one to retire a connection.
+        timeout_keep_alive=120,
     )
     server = uvicorn.Server(config)
 
@@ -130,6 +165,8 @@ async def main():
         await server.serve()
     finally:
         logger.info("shutting down...")
+        if prefetch_task:
+            prefetch_task.cancel()
         if listener:
             listener.stop()
             scheduler_client.close()

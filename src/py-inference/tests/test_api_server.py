@@ -161,3 +161,58 @@ def test_receipt_stream_event_only_when_requested(tmp_path, monkeypatch):
     with c.stream("POST", "/v1/chat/completions", json=req) as r:
         lines = [ln for ln in r.iter_lines() if "om_receipt" in ln]
     assert lines == [], "no receipt event without the gateway header"
+
+
+# --- chat template rendering -------------------------------------------------
+# The bare "role: content" join fed an instruction-tuned model a transcript to
+# CONTINUE rather than a conversation to ANSWER: it completed the user's
+# sentence, invented its own "Assistant:" markers, and (on Qwen3) exposed the
+# raw <think> block to the web UI. These tests pin the fix.
+
+class _FakeTok:
+    chat_template = "{{ messages }}"
+
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt,
+                            **kwargs):
+        assert tokenize is False and add_generation_prompt is True
+        # Echo enough structure to assert on: role markers plus the kwarg that
+        # disables reasoning blocks.
+        et = kwargs.get("enable_thinking")
+        parts = [f"<|{m['role']}|>{m['content']}" for m in messages]
+        return f"TPL[think={et}]" + "".join(parts) + "<|assistant|>"
+
+
+def test_chat_prompt_uses_model_template(monkeypatch):
+    from src.inference import api_server
+
+    class Eng:
+        current_model = "/models/fake"
+
+    monkeypatch.setitem(api_server._tokenizers, "/models/fake", _FakeTok())
+
+    class Msg:
+        def __init__(self, role, content):
+            self.role, self.content = role, content
+
+    out = api_server._chat_prompt(Eng(), [Msg("user", "hi")])
+    assert out.startswith("TPL[think=False]"), \
+        "template must be applied with enable_thinking disabled"
+    assert "<|user|>hi" in out and out.endswith("<|assistant|>")
+    assert "user: hi" not in out, "bare join must not leak once a template exists"
+
+
+def test_chat_prompt_falls_back_without_template(monkeypatch):
+    from src.inference import api_server
+
+    class Eng:
+        current_model = "/models/none"
+
+    # Negative-cached load failure → bare join fallback keeps serving.
+    monkeypatch.setitem(api_server._tokenizers, "/models/none", False)
+
+    class Msg:
+        def __init__(self, role, content):
+            self.role, self.content = role, content
+
+    out = api_server._chat_prompt(Eng(), [Msg("user", "hi"), Msg("assistant", "yo")])
+    assert out == "user: hi\nassistant: yo"

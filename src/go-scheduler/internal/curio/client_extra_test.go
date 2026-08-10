@@ -98,9 +98,9 @@ func TestWaitForProofComplete_Timeout(t *testing.T) {
 // Covers the per-poll error `continue` plus eventual success.
 func TestWaitForProofComplete_PollsThroughErrorUntilComplete(t *testing.T) {
 	client, mock := newTestClient(t)
-	mock.ExpectQuery("SELECT COUNT").WithArgs(int64(1), int64(2), int64(3)).WillReturnRows(proofRows(1, 0)) // immediate: pending
+	mock.ExpectQuery("SELECT COUNT").WithArgs(int64(1), int64(2), int64(3)).WillReturnRows(proofRows(1, 0))          // immediate: pending
 	mock.ExpectQuery("SELECT COUNT").WithArgs(int64(1), int64(2), int64(3)).WillReturnError(errors.New("transient")) // poll 1: error → continue
-	mock.ExpectQuery("SELECT COUNT").WithArgs(int64(1), int64(2), int64(3)).WillReturnRows(proofRows(1, 1)) // poll 2: done
+	mock.ExpectQuery("SELECT COUNT").WithArgs(int64(1), int64(2), int64(3)).WillReturnRows(proofRows(1, 1))          // poll 2: done
 	ok := client.WaitForProofComplete(context.Background(), 1, 2, 3,
 		WaitConfig{PollInterval: 5 * time.Millisecond, MaxWait: time.Hour})
 	if !ok {

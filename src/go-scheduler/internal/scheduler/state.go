@@ -46,16 +46,17 @@ func (sm *StateMachine) Current() GpuState {
 
 // Transition attempts to move to a new state. Returns true if the transition occurred.
 // Valid transitions:
-//   AVAILABLE -> YIELDING       (WindowPoSt approaching)
-//   AVAILABLE -> WINNING_POST   (WinningPoSt triggered)
-//   YIELDING  -> WINDOW_POST    (WindowPoSt imminent/active)
-//   YIELDING  -> WINNING_POST   (WinningPoSt during yield)
-//   WINDOW_POST -> AVAILABLE    (WindowPoSt done)
-//   WINNING_POST -> AVAILABLE   (WinningPoSt done)
-//   WINNING_POST -> YIELDING    (WinningPoSt done but WindowPoSt approaching)
-//   WINNING_POST -> WINDOW_POST (WinningPoSt done but WindowPoSt active)
-//   Any -> WINDOW_POST          (fail-safe)
-//   Any -> AVAILABLE            (resume)
+//
+//	AVAILABLE -> YIELDING       (WindowPoSt approaching)
+//	AVAILABLE -> WINNING_POST   (WinningPoSt triggered)
+//	YIELDING  -> WINDOW_POST    (WindowPoSt imminent/active)
+//	YIELDING  -> WINNING_POST   (WinningPoSt during yield)
+//	WINDOW_POST -> AVAILABLE    (WindowPoSt done)
+//	WINNING_POST -> AVAILABLE   (WinningPoSt done)
+//	WINNING_POST -> YIELDING    (WinningPoSt done but WindowPoSt approaching)
+//	WINNING_POST -> WINDOW_POST (WinningPoSt done but WindowPoSt active)
+//	Any -> WINDOW_POST          (fail-safe)
+//	Any -> AVAILABLE            (resume)
 //
 // NOTE: Transition is intentionally permissive (it accepts any target state).
 // The documented transition graph is advisory; enforcing it here would risk

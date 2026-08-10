@@ -1,0 +1,179 @@
+# OpenModel — mainnet alpha onboarding config (gateway side prefilled).
+# Fill only the fields marked "<<<". Everything else is preset for the
+# mainnet alpha gateway — see the onboarding guide for details.
+
+mode: prod   # self-registration requires a real Lotus client; do not change
+
+lotus:
+  api_url: "http://127.0.0.1:1234/rpc/v0"
+  api_token: "${LOTUS_API_TOKEN}"   # WalletSign needs a sign-permission token; set it in .env
+  miner_address: ""            # <<< miner id, e.g. t01234 / f01234
+
+curio:
+  db_host: "127.0.0.1"
+  db_port: 5433
+  db_user: "yugabyte"
+  db_password: "yugabyte"
+  db_name: "yugabyte"
+  log_path: "/tmp/curio.log"
+
+scheduler:
+  poll_interval_sec: 15
+  yield_before_windowpost_sec: 300
+  grpc_port: 50051
+
+inference:
+  engine: "vllm"
+  model: "/models/Qwen--Qwen3-4B-Instruct-2507"   # <<< one catalog entry; must also be listed in gateway.supported_models
+  api_port: 8000
+  gpu_memory_utilization: 0.93
+  # 4B fp16 on a 10 GB card leaves ~1.04 GiB for the KV cache; 8192 tokens
+  # need 1.12 GiB and the engine refuses to start. 24 GB cards can go to 32768.
+  max_model_len: 4096
+  enforce_eager: true
+  multi_gpu:
+    mode: "tensor_parallel"
+    gpu_count: 1               # <<< number of GPUs for tensor parallel
+    device_ids: [0]
+
+# --- Gateway (mainnet alpha) — prefilled; edit only the "<<<" fields ---
+gateway:
+  url: https://36.189.235.195:18020
+  gateway_id: openmodel-mainnet
+  auto_register: true
+
+  worker_id: ""                # <<< 1-64 chars [A-Za-z0-9_-], e.g. sp-alpha-01
+  payout_address: ""           # <<< EVM address earnings settle to (0x…)
+
+  # Gateway-facing addresses of this worker's two TLS fronts. Ports here are
+  # the PUBLIC mapped ports; local listen ports are set under mtls_front.
+  public_endpoint: https://<public-ip>:<mapped-inference-port>       # <<<
+  public_scheduler_url: https://<public-ip>:<mapped-scheduler-port>  # <<<
+
+  # Production catalog v1. Weights need NOT be pre-placed: entries absent from
+  # disk are fetched automatically (boot model at first start, the rest in the
+  # background) through the FOC registry below. Claim what your hardware can
+  # actually serve — every entry is probed before real traffic routes to it.
+  supported_models:
+    - "/models/Qwen--Qwen3-4B-Instruct-2507"   # qwen3-4b    fp16  ~8G
+    # - "/models/Qwen--Qwen3-8B"               # qwen3-8b    fp16  ~16G
+    # - "/models/openai--gpt-oss-20b"          # gpt-oss-20b mxfp4 ~13G
+    # - "/models/Qwen--Qwen3-32B-AWQ"          # qwen3-32b   awq   ~19G
+
+  token_path: /data/gateway-token.json   # written by the scheduler on registration
+  tls_ca_path: /data/gateway-ca.crt      # gateway CA from the onboarding materials
+
+  mtls_front:
+    enabled: true
+    cert_dir: /data/mtls
+    inference_port: 38443      # local listen port
+    scheduler_port: 39443      # local listen port
+
+foc:
+  backend: "real"
+  real:
+    bridge_url: "http://127.0.0.1:3100"
+    # Mainnet piece-CID registry for the production catalog. Keys are HF ids;
+    # path-form claims (/models/Org--Name) resolve to the same entries. CID
+    # order is upload order — parts are concatenated in this exact order.
+    piece_cid_registry:
+      "Qwen/Qwen3-4B-Instruct-2507":
+        cids:
+          - "bafkzcibfqcaiaoqzovl27pzr2b4vuioigr42ulv7xfs2p4jiban5wfyp7mg7lacdryqq"
+          - "bafkzcibfqcaiaoqzqdlg352mlrtytqjhr2dmmwnbv3aojkhrwmzjq5ysli7wticfhina"
+          - "bafkzcibfqcaiaoqza5qqjwbwdplg2566t5qzbarkqjobgh5tenn44o6qvy5nnuyica5a"
+          - "bafkzcibfqcaiaoqzgtfmvdkdscqz7cz3zjtkrjjdg4cq5x45wxqxdava23gy6475vyra"
+          - "bafkzcibfqcaiaoqzv5jtkrkhqyin2rkbmgsnbmwhhpiu7polegxpep23keiedc3bcmsq"
+          - "bafkzcibfqcaiaoqz3utakge3p3o5b2lxclaax4csc3steqitkfxmh5ccle4fa6ptyejq"
+          - "bafkzcibgrpx33hibdgy37vscsyx43plvrdotr5fgs6exdnmepk6kc5zhycr5mckxgiqd6"
+        # Digest of the assembled archive; a mismatch is rejected and the
+        # file deleted, so tampered weights never reach the engine.
+        sha256: "44faadf0d0161efdbe078251500b9f6270cb6a4abbe9703665270d927c95c039"
+      "Qwen/Qwen3-8B":
+        cids:
+          - "bafkzcibfqcaiaoqz47ck22efi6i23ddotikxxwqijif4ydzfgyylwwhaxgigg2hrmu3a"
+          - "bafkzcibfqcaiaoqzejcozeb5lisb4qq53iaayot4ebzmuoek7uxggsbm7ek7y33s5isa"
+          - "bafkzcibfqcaiaoqzxb5cb6uspxmu3ws3o3ivhtn7vewd5oljna5ih6ctqf2ju5rowq4a"
+          - "bafkzcibfqcaiaoqzqhahi2s2qphwkpwzthef4ncoywws7szmqra6ygjkmv45r7ur3ala"
+          - "bafkzcibfqcaiaoqza55nrkbdp2tztcnfp2hdnfp54gio34gctyug66vfhho2oeaz2umq"
+          - "bafkzcibfqcaiaoqzc64jkzinnuosb4j2xu3mlbtzy4c24bud5bg56pjgb42vcqooauva"
+          - "bafkzcibfqcaiaoqz7mdh7mmbyheaaaqee4amjotgdzv56k5vmazvrruhga4nxaqooyga"
+          - "bafkzcibfqcaiaoqznrwwbpktp2jldzw4jnfirbjo4wvnh3qroimw6bjtmk5ijvgcba5a"
+          - "bafkzcibfqcaiaoqz4d6i3euuqirq2rupsyij5mnotqe7naqyhqwbysu3cnsz7iufruyq"
+          - "bafkzcibfqcaiaoqzipwbuviewha3sq35xqbym4xxslhcbdxcb4snnr4x5m74csxc4mxq"
+          - "bafkzcibfqcaiaoqzldyz34z24utpr4woz4ctfb74oexcceavuyhprq3dlofv6xircqwq"
+          - "bafkzcibfqcaiaoqzl5wyliabq3zfzgqwtbxmjrqovmzi7u7jlqghvne2daqxd4un3mtq"
+          - "bafkzcibfqcaiaoqzi2qgfxa64c363iaidnytn3uffviaqbmfolsfjosrcllkkik6yqjq"
+          - "bafkzcibg4gin5dabdfji2s2nem62nflh72kpcxgdsn3njkj2lj74eipkjdvzggedtavcc"
+      "openai/gpt-oss-20b":
+        cids:
+          - "bafkzcibfqcaiaoqz2ukrtsax6m4vzsds4gt43omitldgfbn4zx5gvkd5hrezhcnocmqa"
+          - "bafkzcibfqcaiaoqzxiv6oneg4bpaaqstncr3oce7rlhkpqb3cdm54sxx454xpub3nmyq"
+          - "bafkzcibfqcaiaoqzvhqil5kvh6pnrh3lroky4nteu6c3fhfpdq7wrqrebfo7mq3ehmwq"
+          - "bafkzcibfqcaiaoqz7plqfiaxnziamm4shtawp724jxpk6uqzifxdhvkw6eclefowtugq"
+          - "bafkzcibfqcaiaoqzej74jbpcjnqb7qmnvatsva2az4krc6c6wxrmpxw5e4tuii2rqiuq"
+          - "bafkzcibfqcaiaoqzmoad7j54had5z5kkafv6krrnu5cx3xrimjovly6cd6xxx524kypa"
+          - "bafkzcibfqcaiaoqzg2i4uxrf5vsovjcyzt3jk7cj6zwljf3v7k5jm2jbqfivopbhoe4q"
+          - "bafkzcibfqcaiaoqzxiiknnjkzz4xiaovlq3b7spjobmfrx4faxj2cahn5pbomx6eiuza"
+          - "bafkzcibfqcaiaoqzaeyxzrgrc4rox7sjn76qll2czrdqli63tk6p2a4ii5xpsnlr7e2q"
+          - "bafkzcibfqcaiaoqzkf2bdjtfvz7ejjlvll2eve2homoznxfhgoldmeh323eeemjfvmla"
+          - "bafkzcibfqcaiaoqzaqvqrq3revwx3um23m5ft4jbudbvjwmo2nci7corquf6gxqzd4pq"
+          - "bafkzcibfqcaiaoqzulmafjlhfe35cryz2fa754dg7p2gnxknvv34d3f4kjkw2fz3t4la"
+          - "bafkzcibfqcaiaoqz3o3xpfa3ahv77fu5ah5eb7jmrfpdvrmzqov7zckucub3yk4wpq2q"
+          - "bafkzcibfqcaiaoqznvjqu3rbnayys6lwxxmczzukgskfedwowtporogzpb3pyqgjjefa"
+          - "bafkzcibfqcaiaoqzqsqr3zue4px5ius2252gcuyfhuwmktzxkpki4atlzgpmi6nx3ina"
+          - "bafkzcibfqcaiaoqz7zqyuona3djj4waziertptwf4mpr3kxav7kdc3tejx2i4uzc24ia"
+          - "bafkzcibfqcaiaoqzkaj4eyuzx35fxqvtir4dqbcvdbmwn26gtt3tjhcip2vg4tdjtitq"
+          - "bafkzcibfqcaiaoqzlcotqhjtsymiro7c7qe34eeu5r5gimeuij2i26f7psvnf5d5h4hq"
+          - "bafkzcibfqcaiaoqzerepwu7xmtzmes7niz5pny34nchpeaqerczn534appuro73bziaa"
+          - "bafkzcibfqcaiaoqzlhxkytivm2gkgwwgu7kxgcstqai252viudo7ar5hf5dmoy46dubq"
+          - "bafkzcibfqcaiaoqzb5wem4ynfh7rhlvegaw725z4axoalnypxngaxxlqboyzp5ws245q"
+          - "bafkzcibfqcaiaoqzigixfa4qyhbzfslb626j2esa73epzh7a6gpbonefkvdk2zi52a3a"
+          - "bafkzcibfqcaiaoqzrolvg4776zlnfq5aiwb365tyrehkkxea6bcv2ulehkpjmvvchavq"
+          - "bafkzcibfqcaiaoqzx7cdk3k2tdtbrr3xa27q2tgve2hwofdsmcehvlv762whlcdc6qiq"
+          - "bafkzcibfqcaiaoqzf2ppz7pllz3zgnxgil4yxwo6nbqolfn2nwqsryn6whvmtgnncela"
+          - "bafkzcibfqcaiaoqz2qo2tcte2h65vgifhefm7ffgrjzaydkx2dqoye6jhimoosx4punq"
+          - "bafkzcibfqcaiaoqzqxe3zko4vlnrwvmjw57f32txhedhjhiobj2smaxogp36daozri3q"
+          - "bafkzcibfqcaiaoqz2vjpfd4ai4ovdotvnjokf7oirfxgrua54n2baokeld7s5upenq3a"
+          - "bafkzcibfqcaiaoqztbn2k2zmrnx3un7kepeito3a6erlx4tbsd3bwgyo3vmyfynnsebq"
+          - "bafkzcibfqcaiaoqzso24uk3ji3blxtnjdxtkthbiax6sqt5h5fybgtheftorboq52mlq"
+          - "bafkzcibfqcaiaoqzyoqxt4hhhewr5hipozdp5u3u3xdestflsk4gt2ym5qxptvfok4ea"
+          - "bafkzcibfqcaiaoqzxhjcbqmmx3nd564xkphvttcwdbrgkkimjzwioo5no5lcd7apgqjq"
+          - "bafkzcibfqcaiaoqzbjf53um6kh2cpf4bzzg7rrftncrt2zwtpxosyov3bp7f25dx3eoq"
+          - "bafkzcibfqcaiaoqzwl5efw4utvaloaouk54xxjnc57fpbicjojqgccueyjafe3ojp4ea"
+          - "bafkzcibfqcaiaoqzx7mhrfowclqcm62yflbchdoddh45apkshmge3shqwbl54fjwsqxa"
+          - "bafkzcibfqcaiaoqzdd2k7e5t77hyuqdzgpkr36g2v6ns2nevm2dhk4qjbssaty6fpm4q"
+          - "bafkzcibfqcaiaoqznfefudv4ezyhsebfggjew3xczpn7r5v3gpk4s6z5fe5w6fbui44a"
+          - "bafkzcibfqcaiaoqz6fudlq7qogj7wqstfh2mvhp2xhfbptovvycuqvhdh5pqx2splyga"
+          - "bafkzcibfqcaiaoqzhmizexgyeccyeorxvn3omvjjzbsx6drzcciiw6ialxg7ia7fqmdq"
+          - "bafkzcibfsxa5kbqvyx32sgq6w7w6h6xe67l5q7tpifwuh2oihpua2q6l2szgpfndpeza"
+      "Qwen/Qwen3-32B-AWQ":
+        cids:
+          - "bafkzcibfqcaiaoqzw3fsq6pldscbt6p3vkravhn7uoptifa3m6xvpj5l5426hvww4uxa"
+          - "bafkzcibfqcaiaoqzrz3ovwpnjxyxrg4uu7zu57b423kmfwyh4agohrvvwwcfupxrcuzq"
+          - "bafkzcibfqcaiaoqzvbawtphscqq67jrxyy5i3cycob2cqx6n32cjom4cmywxgyn76aoq"
+          - "bafkzcibfqcaiaoqzxzad4xi66gmjghjbhbin2yhqjzyehqib63mimwgscsyzkdzx3qqa"
+          - "bafkzcibfqcaiaoqzsokbdywjvzy66m67gvmgaw7paulqklzwarfz2e456f34wivxiqwa"
+          - "bafkzcibfqcaiaoqzj35bzcwaw4cwk5d4ey6albvx5zzj3lyduljsv4vbucvkzpif3izq"
+          - "bafkzcibfqcaiaoqzjt5hbv34lpydiwgojyprg4bhszsmyvuxv3zdojymmytjdpxej4ja"
+          - "bafkzcibfqcaiaoqzznfsehfihnhiisperxp7bz5qbp5h7pfp3rn2h7wvqmoxkoggci5q"
+          - "bafkzcibfqcaiaoqzgr34qro74qfxpcdh55e2uo4n34roswrl2krvvpxttukegqipsq3a"
+          - "bafkzcibfqcaiaoqzpk7bvlp46njpumndcoi3oauu53ozccyoloekrfjq3cntzudy7ala"
+          - "bafkzcibfqcaiaoqzerahx3uqcke4233mmkwd6qia635wioqbpogjcr7u7wtlt347qm4q"
+          - "bafkzcibfqcaiaoqz3dfss4ttu4u4hzma7kzgcm32umyyn6zjixvvzdzkkwfjol4nsq5q"
+          - "bafkzcibfqcaiaoqz3n4qoj6un3kni57cssupi4zpn3tacmu45zy3rs556vghomhvfmvq"
+          - "bafkzcibfqcaiaoqzyin4fr26ix2tbltdjxzjbkyqfzd7yc52hvwg2v3vvsekqf5nbi5q"
+          - "bafkzcibfqcaiaoqz6gvp4tpu5am45ab5vb4ryukmcwlgar23nynjdllhah46bqcz3yxa"
+          - "bafkzcibfqcaiaoqz66qyhd3kjkkmwhivsc7lqyde2hdb6s7jivjvyayozoxkhl43li3a"
+          - "bafkzcibfqcaiaoqz76tuns3cdo5r5bfbpif4a3xw52dvq6wc6kghm5tc3imvh5snp4ma"
+          - "bafkzcibfqcaiaoqz7dobcyuzsozdmaaeqvneib3o5wvfq5vss4c5sid4ibhuiv6fy4vq"
+          - "bafkzcibfzkliulax2zlddu3buvm756rucansnf5iyjmchug6o3zpcavh6ahztkaani2a"
+
+metrics:
+  port: 9090
+  enabled: true
+  auth_token: ""               # optional static token for the local status API
+
+logging:
+  level: "info"
+  format: "text"

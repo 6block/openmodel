@@ -40,9 +40,9 @@ type Scheduler struct {
 	// Monotonic generation for WinningPoSt resume timers. Each new win bumps it;
 	// a timer only resumes if its generation is still current, so an earlier
 	// timer cannot resume during a later, still-active win (fixes double-timer race).
-	winningGen atomic.Int64
-	proofWaitCfg       curio.WaitConfig
-	minerID            int64 // sp_id numeric (e.g., 182063 for t0182063)
+	winningGen   atomic.Int64
+	proofWaitCfg curio.WaitConfig
+	minerID      int64 // sp_id numeric (e.g., 182063 for t0182063)
 
 	// Track completed proofs to prevent re-yielding for the same deadline.
 	// A set keyed by (periodStart, deadline) — a single proving period can have

@@ -158,14 +158,18 @@ test('rejects when total download exceeds the size cap', async () => {
   }
 });
 
-// === concurrent download to the same destPath → 409 ===
-test('rejects a concurrent download to the same destPath', async () => {
+// === concurrent download to the same destPath → joins, never 409 ===
+// A flat 409 turned a slow-but-healthy fetch into a crash loop: the server keeps
+// downloading after a client times out, so the restarted client hit 409 forever.
+test('a second request for the same destPath JOINS the in-flight download', async () => {
   const dir = tmpDir();
   let release;
   const gate = new Promise((res) => { release = res; });
   let firstStartedResolve;
   const firstStarted = new Promise((res) => { firstStartedResolve = res; });
+  let fetchCalls = 0;
   const fetchImpl = async (url) => {
+    fetchCalls++;
     firstStartedResolve();
     await gate; // hold the first request's fetch open
     return okResp('DATA');
@@ -176,12 +180,19 @@ test('rejects a concurrent download to the same destPath', async () => {
     const out = path.join(dir, 'same.tar.gz');
     const p1 = req(server, 'POST', '/download-model', { body: { pieceCids: ['c0'], destPath: out } });
     await firstStarted; // ensure req1 holds the in-flight lock
-    const r2 = await req(server, 'POST', '/download-model', { body: { pieceCids: ['c0'], destPath: out } });
-    assert.equal(r2.status, 409, 'second concurrent download to same dest must be rejected');
-    assert.match(r2.body.error, /already in progress/);
+    // The joiner must NOT return before the download finishes, and must get the
+    // same successful result — one download, two satisfied callers.
+    let r2settled = false;
+    const p2 = req(server, 'POST', '/download-model', { body: { pieceCids: ['c0'], destPath: out } })
+      .then((r) => { r2settled = true; return r; });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(r2settled, false, 'joiner must wait for the in-flight download, not answer early');
     release();
-    const r1 = await p1;
+    const [r1, r2] = await Promise.all([p1, p2]);
     assert.equal(r1.status, 200);
+    assert.equal(r2.status, 200, 'joiner must succeed, not 409');
+    assert.equal(r2.body.sha256, r1.body.sha256, 'joiner must get the same result');
+    assert.equal(fetchCalls, 1, 'the payload must be fetched exactly once');
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });

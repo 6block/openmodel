@@ -10,18 +10,43 @@
  */
 
 import 'dotenv/config';
+// Node 20 polyfill: @filoz/synapse-core uses Promise.withResolvers (Node 22+).
+if (!Promise.withResolvers) {
+  Promise.withResolvers = function () {
+    let resolve, reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  };
+}
 import { Synapse } from '@filoz/synapse-sdk';
-import { calibration } from '@filoz/synapse-core/chains';
+import { calibration, mainnet } from '@filoz/synapse-core/chains';
 import { http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { statSync, createReadStream, readdirSync } from 'fs';
+import { statSync, createReadStream, readdirSync, readFileSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { resolve, basename, join } from 'path';
 import { tmpdir } from 'os';
 
 const PRIVATE_KEY = process.env.FOC_PRIVATE_KEY;
-const RPC_URL = process.env.FOC_RPC_URL || 'https://api.calibration.node.glif.io/rpc/v1';
+const NETWORK = process.argv.includes('--network') ? process.argv[process.argv.indexOf('--network')+1] : 'calibration';
+const CHAIN = NETWORK === 'mainnet' ? mainnet : calibration;
+const RPC_URL = process.env.FOC_RPC_URL || (NETWORK === 'mainnet' ? 'https://api.node.glif.io/rpc/v1' : 'https://api.calibration.node.glif.io/rpc/v1');
+if (NETWORK === 'mainnet' && RPC_URL.includes('calibration')) {
+  console.error('REFUSING: mainnet upload with a calibration RPC. Pass FOC_RPC_URL=https://api.node.glif.io/rpc/v1 explicitly.');
+  process.exit(1);
+}
+if (NETWORK !== 'mainnet' && RPC_URL.includes('api.node.glif.io')) {
+  console.error('REFUSING: calibration upload with a MAINNET RPC — would sign real-chain transactions from a test flow.');
+  process.exit(1);
+}
 const MAX_PART_SIZE = 900 * 1024 * 1024; // 900 MB per part
+// Attempts per part. The upload itself is reliable; the on-chain commit that
+// follows it times out sporadically on the provider side, so a retry usually
+// lands. Backoff grows 30s/60s/... between attempts.
+const PART_UPLOAD_ATTEMPTS = Number(process.env.FOC_PART_ATTEMPTS || 4);
+// Where the weights volume is mounted; the CID registry is written here so it
+// survives log rotation and container restarts.
+const MODELS_DIR = process.env.MODEL_CACHE_DIR || '/models';
 
 if (!PRIVATE_KEY) {
   console.error('ERROR: FOC_PRIVATE_KEY is required. Set it in .env');
@@ -79,7 +104,7 @@ async function main() {
   console.log(`Model name: ${name}`);
 
   // Pack model directory as tar.gz
-  const tarPath = join(tmpdir(), `foc-upload-${Date.now()}.tar.gz`);
+  const tarPath = join(tmpdir(), `foc-upload-${basename(modelDir)}.tar.gz`);
   console.log(`\nPacking model to ${tarPath}...`);
   execSync(`tar -czf "${tarPath}" -C "${modelDir}" .`, { stdio: 'inherit' });
 
@@ -110,10 +135,10 @@ async function main() {
 
   const synapse = Synapse.create({
     account,
-    chain: calibration,
+    chain: CHAIN,
     transport: http(RPC_URL),
   });
-  console.log('Synapse SDK initialized');
+  console.log(`Synapse SDK initialized (network ${NETWORK}, chain ${CHAIN.id}, view ${CHAIN.contracts.fwssView.address})`);
 
   // Upload each part
   const results = [];
@@ -130,12 +155,40 @@ async function main() {
 
     console.log('Uploading to FOC...');
     const partStart = Date.now();
-    const result = await synapse.storage.upload(data);
+    // Retry each part on its own. The bytes reach the storage provider quickly;
+    // what times out is the on-chain commit ("data is stored but not on-chain"),
+    // and it fails at random parts. Without this, one flaky commit discards the
+    // whole model — a 40-part upload died that way, hours in.
+    let result;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        result = await synapse.storage.upload(data);
+        break;
+      } catch (err) {
+        const msg = err.shortMessage || err.message || String(err);
+        if (attempt >= PART_UPLOAD_ATTEMPTS) {
+          console.error(`Part ${i + 1} failed after ${attempt} attempts: ${msg}`);
+          throw err;
+        }
+        const backoffSec = 30 * attempt;
+        console.warn(`Part ${i + 1} attempt ${attempt}/${PART_UPLOAD_ATTEMPTS} failed: ${msg}`);
+        console.warn(`  retrying in ${backoffSec}s ...`);
+        await new Promise((r) => setTimeout(r, backoffSec * 1000));
+      }
+    }
     const partElapsed = ((Date.now() - partStart) / 1000).toFixed(1);
 
     console.log(`Part ${i + 1} uploaded in ${partElapsed}s`);
     console.log(`Result:`, result);
-    results.push({ part: parts[i], result: String(result) });
+    // Keep the piece CID itself, not String(result) — that stringifies to
+    // "[object Object]", which is how one model's CIDs became unrecoverable
+    // once its log was overwritten. Without the CIDs the bytes are on-chain
+    // but unreachable.
+    results.push({
+      part: parts[i],
+      pieceCid: String(result?.pieceCid ?? result),
+      sizeBytes: partStat.size,
+    });
   }
 
   const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -146,8 +199,25 @@ async function main() {
   console.log(`Parts: ${parts.length}`);
   console.log(`Results:`);
   for (const r of results) {
-    console.log(`  ${r.part}: ${r.result}`);
+    console.log(`  ${r.part}: ${r.pieceCid}`);
   }
+
+  // Persist the CIDs next to the weights. Logs get truncated by the next run;
+  // this registry is what a downloader actually needs (ordered CIDs — the parts
+  // must be concatenated in upload order or the archive is garbage).
+  const registryPath = join(MODELS_DIR, 'foc-registry.json');
+  let registry = {};
+  try { registry = JSON.parse(readFileSync(registryPath, 'utf8')); } catch { }
+  registry[name] = {
+    network: NETWORK,
+    chainId: CHAIN.id,
+    parts: results.map((r) => r.pieceCid),
+    partSizes: results.map((r) => r.sizeBytes),
+    totalBytes: results.reduce((a, r) => a + r.sizeBytes, 0),
+    uploadedAt: new Date().toISOString(),
+  };
+  writeFileSync(registryPath, JSON.stringify(registry, null, 2) + '\n');
+  console.log(`Registry updated: ${registryPath}`);
   console.log(`========================================`);
 
   // Cleanup

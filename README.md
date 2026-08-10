@@ -16,6 +16,7 @@ settlement smart contract and billing verifier live in
 ```
 openmodel/
 ├── README.md               # This document (deployment guide)
+├── UPDATE-NOTES.md         # What changed in v1.3.0 (read before upgrading)
 ├── docker-compose.yml      # Compose file (pre-built images)
 ├── .env.example            # Environment variable template
 ├── config/                 # Scenario configs (single GPU / 8-GPU / FOC download)
@@ -29,8 +30,8 @@ Three containerized services, one `docker compose up -d`:
 
 | Service | Image | Role | Port |
 |---|---|---|---|
-| Scheduler | `openmodel-scheduler` | Watches the miner's proving deadlines (Lotus RPC) and WinningPoSt elections (Curio); orders the GPUs to yield/resume | 9090 |
-| Inference | `openmodel-inference` | vLLM engine, OpenAI-compatible REST API; one engine per GPU (multi-instance) or one model across GPUs (tensor parallel) | 8000 |
+| Scheduler | `openmodel-scheduler` | Watches the miner's proving deadlines (Lotus RPC) and WinningPoSt elections (Curio); orders the GPUs to yield/resume; self-registers with a gateway and runs the worker's TLS front | 9090 (+39443 TLS) |
+| Inference | `openmodel-inference` | vLLM engine, OpenAI-compatible REST API; one engine per GPU (multi-instance) or one model across GPUs (tensor parallel) | 8000 (+38443 TLS) |
 | FOC Bridge | `openmodel-foc-bridge` | Downloads model weights from Filecoin SP retrieval URLs, with streaming sha256 integrity verification | 3100 |
 
 ## Requirements
@@ -38,7 +39,7 @@ Three containerized services, one `docker compose up -d`:
 | Item | Requirement |
 |---|---|
 | OS | Ubuntu 22.04+ |
-| GPU | NVIDIA, 10 GB+ VRAM each, driver 535+ |
+| GPU | NVIDIA, 10 GB+ VRAM each, **driver 580+** (images are CUDA 13; older 5xx drivers fail at container start — verified: 580.159 runs, 560.35 does not) |
 | Docker | 24+ with Compose v2 and NVIDIA Container Toolkit |
 | Mining | A running Lotus node (HTTP RPC) and Curio/YugabyteDB |
 
@@ -60,7 +61,9 @@ cp .env.example .env       # set LOTUS_API_TOKEN, SIDECAR_CONFIG, MODEL_CACHE_DI
 #    sidecar-8gpu-tensor.yaml  8 GPUs, tensor parallel (14B+ models)
 #    sidecar-foc.yaml          single GPU, weights fetched from a Filecoin SP
 
-# 4. Launch
+# 4. (Optional but recommended) Fill in the gateway block — see next section
+
+# 5. Launch
 docker compose up -d
 ```
 
@@ -75,9 +78,125 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"default","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
 ```
 
-To attach this worker to a gateway, register it from the gateway's admin API with
-this machine's inference/scheduler URLs and the same worker token configured here
-(see the gateway repository's API docs).
+## Production model catalog
+
+The network bills per model, so the servable set is a **fixed catalog** — and
+which catalog entries a worker offers is the SP's own choice, declared in
+`gateway.supported_models` and proven per entry by the admission probe before
+any traffic routes to it. The v1 catalog (four entries, one family as the
+backbone, context capped at 32k):
+
+| canonical-id | HF repo | quant | weights | local path under /models | typical hardware |
+|---|---|---|---|---|---|
+| `qwen3-4b` | Qwen/Qwen3-4B-Instruct-2507 | fp16 | ~8 GB | `Qwen--Qwen3-4B-Instruct-2507` | 1× 24 GB, or 2× 10 GB (TP=2) |
+| `qwen3-8b` | Qwen/Qwen3-8B | fp16 | ~16 GB | `Qwen--Qwen3-8B` | 1× 24 GB, or 4× 10 GB (TP=4) |
+| `gpt-oss-20b` | openai/gpt-oss-20b | mxfp4 (native) | ~13 GB | `openai--gpt-oss-20b` | 1× 24 GB, or 2–4× 10 GB |
+| `qwen3-32b` | Qwen/Qwen3-32B-AWQ | awq-int4 | ~19 GB | `Qwen--Qwen3-32B-AWQ` | 1× 24 GB (tight), 4–8× 10 GB (TP) |
+
+Rules that keep the catalog honest:
+
+- **Quantisation is part of the entry.** Deploy exactly the repo and quant
+  listed; a same-name different-quant deployment fails its verification.
+- **Claiming is not serving.** Every entry you list in `supported_models` gets
+  probed (load + capability) before the gateway routes real traffic to it, and
+  is re-checked periodically afterwards.
+  set `HF_TOKEN` before first download.
+- On 10 GB-class cards the 32k context is tight (tensor-parallel + eager mode
+  required); 24 GB-class cards are comfortable. Smaller `max_model_len`
+  configurations are a per-SP choice.
+
+## Join a gateway (self-registration)
+
+Since v1.3.0 the worker registers **itself** — no action on the gateway side.
+Fill in the `gateway:` block of your chosen sidecar config:
+
+```yaml
+gateway:
+  url: https://<gateway-host>:<port>   # https strongly recommended over public networks
+  gateway_id: <the gateway's advertised id>   # TLS identity of the gateway (not its address)
+  worker_id: my-sp-worker-1            # 1–64 chars, alphanumeric / - _
+  payout_address: "0x…"                # EVM address your earnings settle to
+  public_endpoint: https://<this-host>:38443       # your inference TLS front, as the gateway reaches it
+  public_scheduler_url: https://<this-host>:39443  # your scheduler TLS front
+  gpu_count: 8
+  supported_models:                    # everything you can serve; entries absent on disk are prefetched at start-up
+    - "/models/Qwen--Qwen2.5-3B-Instruct"
+  auto_register: true
+  # token_path is WRITTEN BY the scheduler (the issued token persists here, 0600)
+  # — nothing to prepare. tls_ca_path is the one file YOU place: the CA
+  # certificate from your gateway operator's onboarding materials; needed only
+  # for the very first registration over https (afterwards the cert store's CA
+  # is trusted). Both live under ./data on the host (see docker-compose.yml).
+  # Note: this CA is the worker network's identity layer, not a stopgap — even
+  # when the gateway serves the public under a real domain certificate, the
+  # worker directions keep this CA (identities are worker_id/gateway_id,
+  # decoupled from any address or domain).
+  token_path: /data/gateway-token.json
+  tls_ca_path: /data/gateway-ca.crt
+  mtls_front:
+    enabled: true
+    cert_dir: /data/mtls
+```
+
+What happens on start-up: the scheduler asks the gateway for a challenge, signs
+it with the **miner's key via Lotus** (proof of miner control), and receives a
+per-worker bearer token plus — when the gateway runs a registration CA — a
+worker TLS certificate, in one round-trip. The token is pushed to the inference
+container automatically; certificates renew themselves at half-life. Both TLS
+directions verify **identities, not addresses** (worker_id / gateway_id in the
+SAN), so public port mappings can change freely without reissuing anything.
+
+Claimed weights are **prefetched at start-up**: every `supported_models` entry
+absent from local disk is fetched in the background — through the FOC
+piece-CID registry when the entry is configured there, otherwise (HF-form ids
+like `Org/Name`) from Hugging Face — so a gateway-triggered switch never
+embeds a multi-minute download; it only pays the load time. Two limits:
+path-form entries (`/models/…`) without an FOC registry entry cannot be
+prefetched (place those weights yourself), and the boot model
+(`inference.model`) is fetched before the API comes up — a slow first boot;
+pre-place it to skip the wait.
+
+When the FOC fetch fails — e.g. the retrieval provider is down — catalog-shaped
+entries **fall back to Hugging Face** via the canonical name transform
+(`/models/Org--Name` → `Org/Name`), fetched into the same directory and
+honoring `HF_ENDPOINT` / `HF_TOKEN`. The fallback is logged loudly because that
+copy is not covered by the FOC-pinned digest; set `HF_FALLBACK=0` to disable it.
+
+Watch your own state — including the gateway's admission verdict on every model
+you claim — from this machine alone. `$SCHEDULER_TOKEN` is `metrics.auth_token`
+from your sidecar config if you set one; otherwise (once registered) use the
+gateway-issued worker token — the `auth_token` field inside the file at
+`gateway.token_path` (`/data/gateway-token.json` in the sample; it is 0600 and
+container-owned, so read it as
+`docker exec openmodel-scheduler cat /data/gateway-token.json`). With a dynamic
+token present these endpoints always require auth; they are open only when the
+worker has neither a static token nor a registration:
+
+```bash
+curl -s -H "Authorization: Bearer $SCHEDULER_TOKEN" http://127.0.0.1:9090/registration
+```
+
+- `gateway_link.verdict`: `serving` (gateway is polling you) / `waiting` /
+  `unreachable` / `silent`. A rejected re-registration next to `serving` means
+  "cannot re-register, but still working" — normal when a gateway raises its
+  admission floor; existing registrations are not evicted.
+- `model_admission.models[]`: per claimed model — `status`
+  (`verified` / `pending` / `failing`), the exact score `floor` you are held
+  to, `consecutive_fails` (3 escalate, only after an independent confirmation
+  re-test), and evidence-window progress. Gateways probe claimed models with
+  exam requests that are **not billed and earn nothing**, and are deliberately
+  indistinguishable from user traffic.
+- Fixed the underlying problem and want re-examination now:
+
+  ```bash
+  curl -s -X POST -H "Authorization: Bearer $SCHEDULER_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"/models/Qwen--Qwen2.5-3B-Instruct"}' \
+    http://127.0.0.1:9090/registration/reverify
+  ```
+
+  One request per model per 10 minutes; the reset clears accumulated evidence
+  too, so retrying never stacks luck.
 
 ## GPU yield behaviour
 
@@ -91,35 +210,28 @@ this machine's inference/scheduler URLs and the same worker token configured her
   the next scheduled yield begins; while mining, the estimated seconds until
   resume. Gateways use this to route long requests away from imminent yields.
 
-## What's new in v1.2.0
+## What's new in v1.3.0
 
-All changes are backward-compatible; an older gateway simply ignores the new
-surfaces (capabilities are negotiated via `/health`).
+See [UPDATE-NOTES.md](UPDATE-NOTES.md) for the full list and upgrade caveats.
+Highlights:
 
-- **Per-worker authentication**: inference `/v1/*` and scheduler `/ready` +
-  `/debug/*` can require a Bearer token (`INFERENCE_API_TOKEN` env / scheduler
-  `metrics.auth_token`), so a worker exposed to a public network cannot be used
-  around the gateway. Empty token keeps the previous open LAN behaviour.
-- **Signed billing receipts**: every served request is attested by a worker-held
-  ed25519 key — sha256 of the exact request body, sha256 of the generated text,
-  and the token counts, signed and attached to the response. The public key is
-  advertised on `/health` (`receipt_pubkey`); the key persists at
-  `/models/.openmodel/receipt-ed25519.key`. This makes every charge independently
-  verifiable end-to-end (see the openmodel-contracts repository).
-- **Stream continuation**: the worker can resume another worker's interrupted
-  stream mid-generation, so a mining yield no longer breaks a client's stream —
-  the gateway re-dispatches the remainder transparently.
-- **Model weight integrity**: FOC downloads verify a pinned sha256 while
-  streaming; a mismatch returns 422 and deletes the file, so a corrupted or
-  tampered weight never reaches the engine.
-- **Predictive readiness**: the `/ready` field described above, kept live
-  continuously (not only at state changes).
-- **Generation stall guard**: if an engine dies mid-generation, in-flight
-  requests are aborted with a retryable error after a per-token stall limit
-  (default 60 s) instead of hanging until client timeout.
-- **Robustness**: multi-partition WindowPoSt proof detection; engine reload
-  retries with process self-restart as a last resort; gRPC hardening against
-  malformed status reports.
+- **Self-registration**: challenge → miner-key signature → per-worker token,
+  fully worker-initiated; token rotation on re-registration.
+- **Certificate-at-registration + built-in TLS fronts** (38443/39443):
+  encrypted gateway→worker transport with identities decoupled from addresses;
+  automatic renewal at half-life.
+- **Worker→gateway HTTPS**: `gateway.url: https://…` verified against the same
+  registration CA (identity = gateway_id); `tls_ca_path` bootstraps the first
+  registration; fail-closed without a CA.
+- **Dynamic per-worker tokens** pushed to the inference container; accepted
+  alongside the static token.
+- **Claimed model list + on-demand switching**: `supported_models` reaches the
+  gateway's model-aware router; local path-named weights resolve correctly.
+- **Admission self-service**: per-model verification status, the exact floor,
+  and a rate-limited re-verification trigger — all from the worker's own box.
+- **Chat template rendering** (fix): conversations render with the model's own
+  template — no more transcript-continuation artifacts or leaked reasoning
+  blocks; noticeably better answers, especially on Qwen3-class models.
 
 ## Build from source
 
@@ -132,10 +244,12 @@ docker build -t openmodel-foc-bridge:latest src/foc-bridge
 ```
 
 Note: build the inference image on an x86_64 host with NVIDIA tooling; the
-resulting image is ~13 GB (CUDA + PyTorch + vLLM).
+resulting image is ~13 GB (CUDA 13 + PyTorch + vLLM 0.22).
 
 ## Troubleshooting
 
+- **`nvidia-container-cli: requirement error: unsatisfied condition: cuda>=13.0`**:
+  host driver older than 580. Upgrade the driver, or deploy v1.2.0 images.
 - **GPU not detected**: check `nvidia-smi` on the host and that the NVIDIA
   Container Toolkit is installed (`docker info | grep -i nvidia`).
 - **Inference stuck loading**: first model load downloads weights; check
@@ -144,13 +258,24 @@ resulting image is ~13 GB (CUDA + PyTorch + vLLM).
   (port 1234) is reachable from the container (`network_mode: host`).
 - **503 responses**: the miner is proving; this is by design. Honor
   `Retry-After`.
+- **401 from inference after a restart**: the dynamic token is pushed by the
+  scheduler within a few seconds of (re)registration; if it persists, check
+  `/registration` → `gateway_link` and that scheduler and inference are both
+  v1.3.0 (mixed versions cannot exchange dynamic tokens).
+- **`gateway_link: unreachable` vs `silent`**: `unreachable` means this worker
+  cannot reach the gateway (network/mapping); `silent` means the gateway is
+  reachable but no longer polling this worker (deregistered?) — re-register or
+  contact the gateway operator.
 
 ## Versions
 
-- **v1.2.0** (this release): see "What's new" above.
+- **v1.3.0** (this release): see UPDATE-NOTES.md.
+- v1.2.0: per-worker auth, signed billing receipts, stream continuation,
+  weight integrity, predictive readiness.
 - v1.1.1: accurate token accounting, SSE streaming fixes, multi-partition
   WindowPoSt detection.
 - v1.0.0: initial release.
 
-Compatible gateway: openmodel-gateway v2.x (older gateways work; new billing
-features stay dormant without gateway support).
+Compatible gateway: openmodel-gateway v2.1+ (self-registration, certificate
+issuance, admission probes). Older gateways work; the new surfaces stay dormant
+and the worker serves with its static token.

@@ -86,7 +86,9 @@ export function createApp(opts = {}) {
   // Injectable fetch (url, opts) => Response — defaults to the real timeout-wrapped fetch.
   const doFetch = opts.fetchImpl || fetchWithTimeout;
   // Guards against two concurrent downloads writing the same destination file.
-  const inFlight = new Set();
+  // destination -> promise of the in-flight download's result. A second
+  // request for the SAME destination joins it instead of being rejected.
+  const inFlight = new Map();
 
   // Fetch one part, falling back to the secondary SP on ANY primary failure —
   // a thrown error (network/timeout) OR a non-ok HTTP status (e.g. the piece is
@@ -192,12 +194,23 @@ export function createApp(opts = {}) {
       return res.status(400).json({ error: err.message });
     }
 
-    // Reject a second concurrent download to the same destination (would interleave
-    // writes and corrupt the file).
+    // A second request for the same destination JOINS the running download
+    // instead of being rejected. Two concurrent writers would corrupt the file,
+    // but a flat 409 was worse: the server keeps fetching after a client gives
+    // up, so a restarted client hit 409 forever and never got its weights
+    // (observed as an endless crash loop on a slow link).
     if (inFlight.has(outPath)) {
-      return res.status(409).json({ error: 'a download to this destination is already in progress' });
+      console.log(`Joining in-flight download -> ${outPath}`);
+      try {
+        const joined = await inFlight.get(outPath);
+        return res.status(joined.status).json(joined.body);
+      } catch (err) {
+        return res.status(500).json({ error: err.message });
+      }
     }
-    inFlight.add(outPath);
+    let settle;
+    inFlight.set(outPath, new Promise((resolve) => { settle = resolve; }));
+    const reply = (status, body) => { settle({ status, body }); return res.status(status).json(body); };
 
     console.log(`Model download requested: ${pieceCids.length} parts -> ${outPath}`);
     const startTime = Date.now();
@@ -251,7 +264,7 @@ export function createApp(opts = {}) {
       if (sha256 !== undefined && computed !== String(sha256).toLowerCase()) {
         try { await unlink(outPath); } catch {}
         console.error(`WEIGHT INTEGRITY FAILURE: expected sha256 ${sha256}, got ${computed} -- file deleted`);
-        return res.status(422).json({
+        return reply(422, {
           error: 'sha256 mismatch: downloaded weights do NOT match the pinned digest (file deleted)',
           expected: String(sha256).toLowerCase(),
           computed,
@@ -262,7 +275,7 @@ export function createApp(opts = {}) {
       }
       console.log(`Model download complete: ${pieceCids.length} parts, ${(finalStat.size / (1024 * 1024)).toFixed(1)} MB, ${elapsed}s, sha256=${computed} verified=${sha256 !== undefined}`);
 
-      res.json({
+      reply(200, {
         success: true,
         path: outPath,
         sizeBytes: finalStat.size,
@@ -274,8 +287,11 @@ export function createApp(opts = {}) {
     } catch (err) {
       console.error('Model download error:', err.message);
       try { await unlink(outPath); } catch {}
-      res.status(500).json({ error: err.message });
+      reply(500, { error: err.message });
     } finally {
+      // Settle defensively: an early return that skipped reply() must not leave
+      // joiners hanging forever.
+      settle({ status: 500, body: { error: 'download ended without a result' } });
       inFlight.delete(outPath);
     }
   });

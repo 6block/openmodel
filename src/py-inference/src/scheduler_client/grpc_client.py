@@ -17,6 +17,9 @@ class GpuSchedule:
     state: int  # GpuState enum value
     seconds_until_next_change: int
     message: str
+    # Per-worker gateway Bearer token from SP self-registration (rotates on
+    # re-registration; empty when self-registration is disabled).
+    gateway_auth_token: str = ""
 
     @property
     def is_available(self) -> bool:
@@ -53,6 +56,10 @@ class SchedulerClient:
             state=resp.current_state,
             seconds_until_next_change=resp.seconds_until_next_change,
             message=resp.message,
+            # getattr: tolerate stale generated stubs (pre-token proto) so a
+            # partially-updated deployment degrades to "no dynamic token"
+            # instead of crash-looping the listener.
+            gateway_auth_token=getattr(resp, "gateway_auth_token", ""),
         )
 
     def subscribe_events(self):

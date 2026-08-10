@@ -399,8 +399,14 @@ type ScheduleResponse struct {
 	CurrentState           GpuState               `protobuf:"varint,1,opt,name=current_state,json=currentState,proto3,enum=sidecar.GpuState" json:"current_state,omitempty"`
 	SecondsUntilNextChange int64                  `protobuf:"varint,2,opt,name=seconds_until_next_change,json=secondsUntilNextChange,proto3" json:"seconds_until_next_change,omitempty"`
 	Message                string                 `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// Per-worker gateway auth token obtained by SP self-registration. The
+	// inference service merges it into its accepted Bearer tokens so the gateway
+	// can authenticate immediately after a (re-)registration rotates the token.
+	// Empty when self-registration is disabled (older schedulers simply never
+	// set it — proto3 default keeps this backward compatible).
+	GatewayAuthToken string `protobuf:"bytes,4,opt,name=gateway_auth_token,json=gatewayAuthToken,proto3" json:"gateway_auth_token,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ScheduleResponse) Reset() {
@@ -454,6 +460,13 @@ func (x *ScheduleResponse) GetMessage() string {
 	return ""
 }
 
+func (x *ScheduleResponse) GetGatewayAuthToken() string {
+	if x != nil {
+		return x.GatewayAuthToken
+	}
+	return ""
+}
+
 var File_sidecar_proto protoreflect.FileDescriptor
 
 const file_sidecar_proto_rawDesc = "" +
@@ -474,11 +487,12 @@ const file_sidecar_proto_rawDesc = "" +
 	"\x13gpu_utilization_pct\x18\x03 \x01(\x02R\x11gpuUtilizationPct\x12!\n" +
 	"\floaded_model\x18\x04 \x01(\tR\vloadedModel\x12%\n" +
 	"\x0etimestamp_unix\x18\x05 \x01(\x03R\rtimestampUnix\"\x11\n" +
-	"\x0fScheduleRequest\"\x9f\x01\n" +
+	"\x0fScheduleRequest\"\xcd\x01\n" +
 	"\x10ScheduleResponse\x126\n" +
 	"\rcurrent_state\x18\x01 \x01(\x0e2\x11.sidecar.GpuStateR\fcurrentState\x129\n" +
 	"\x19seconds_until_next_change\x18\x02 \x01(\x03R\x16secondsUntilNextChange\x12\x18\n" +
-	"\amessage\x18\x03 \x01(\tR\amessage*\x89\x01\n" +
+	"\amessage\x18\x03 \x01(\tR\amessage\x12,\n" +
+	"\x12gateway_auth_token\x18\x04 \x01(\tR\x10gatewayAuthToken*\x89\x01\n" +
 	"\bGpuState\x12\x15\n" +
 	"\x11GPU_STATE_UNKNOWN\x10\x00\x12\x17\n" +
 	"\x13GPU_STATE_AVAILABLE\x10\x01\x12\x16\n" +

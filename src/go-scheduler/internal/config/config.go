@@ -9,13 +9,67 @@ import (
 )
 
 type Config struct {
-	Mode      string          `yaml:"mode"` // "dev" or "prod"
-	Lotus     LotusConfig     `yaml:"lotus"`
-	Curio     CurioConfig     `yaml:"curio"`
-	Scheduler SchedulerConfig `yaml:"scheduler"`
-	GRPC      GRPCConfig      `yaml:"grpc"`
-	Metrics   MetricsConfig   `yaml:"metrics"`
-	Logging   LoggingConfig   `yaml:"logging"`
+	Mode      string           `yaml:"mode"` // "dev" or "prod"
+	Lotus     LotusConfig      `yaml:"lotus"`
+	Curio     CurioConfig      `yaml:"curio"`
+	Scheduler SchedulerConfig  `yaml:"scheduler"`
+	GRPC      GRPCConfig       `yaml:"grpc"`
+	Metrics   MetricsConfig    `yaml:"metrics"`
+	Gateway   GatewayRegConfig `yaml:"gateway"`
+	Logging   LoggingConfig    `yaml:"logging"`
+}
+
+// GatewayRegConfig configures SP self-registration with an OpenModel gateway.
+// When auto_register is set, the scheduler proves miner control by signing the
+// gateway's challenge with the miner's worker/owner key from the local Lotus
+// wallet, receives the per-worker auth token, and hands it to the inference
+// service over gRPC — no operator action needed on either side.
+type GatewayRegConfig struct {
+	URL string `yaml:"url"` // gateway base URL, e.g. "http://gateway-host:3000"
+	// GatewayID must equal the gateway's sp_registration.gateway_id — the signed
+	// message is domain-bound to it so it cannot be replayed against another gateway.
+	GatewayID string `yaml:"gateway_id"`
+	WorkerID  string `yaml:"worker_id"` // default: "sp-" + miner address
+	// PayoutAddress is the EVM address this SP's earnings settle to. It is part
+	// of the miner-signed message, so nobody (gateway included) can redirect it.
+	PayoutAddress string `yaml:"payout_address"`
+	// PublicEndpoint / PublicSchedulerURL are this worker's py-inference and
+	// scheduler URLs as reachable FROM the gateway (public IP or tunnel).
+	PublicEndpoint     string   `yaml:"public_endpoint"`
+	PublicSchedulerURL string   `yaml:"public_scheduler_url"`
+	GPUCount           int      `yaml:"gpu_count"`
+	SupportedModels    []string `yaml:"supported_models"`
+	// TLSCAPath is the trust anchor for an https gateway.url — the registration
+	// CA certificate, distributed with onboarding materials. Once a registration
+	// succeeds the cert store holds the same CA, so this matters mainly for the
+	// very first (cold) registration.
+	TLSCAPath    string `yaml:"tls_ca_path"`
+	AutoRegister bool   `yaml:"auto_register"`
+	// TokenPath persists the issued token (0600) so restarts stay authenticated;
+	// mount a small volume there in Docker. Default /data/gateway-token.json.
+	TokenPath string `yaml:"token_path"`
+	// MTLSFront enables the built-in mTLS front: registration submits a CSR (the
+	// private key NEVER leaves this machine), the gateway signs a short-lived
+	// worker certificate, and this scheduler terminates mTLS itself on the two
+	// ports below — no nginx, no reload (certificates hot-swap per handshake).
+	// Renewal runs automatically at half the certificate lifetime; a banned or
+	// deregistered worker is refused renewal and ages out of the mTLS layer.
+	MTLSFront MTLSFrontConfig `yaml:"mtls_front"`
+}
+
+// MTLSFrontConfig — see GatewayRegConfig.MTLSFront.
+type MTLSFrontConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Listen ports for the TLS side. Point public_endpoint / public_scheduler_url
+	// at these (https://...) once enabled.
+	InferencePort int `yaml:"inference_port"` // default 8443 → proxies 127.0.0.1:8000
+	SchedulerPort int `yaml:"scheduler_port"` // default 9443 → proxies 127.0.0.1:9090
+	// Backends being fronted (plaintext, local).
+	InferenceBackend string `yaml:"inference_backend"` // default http://127.0.0.1:8000
+	SchedulerBackend string `yaml:"scheduler_backend"` // default http://127.0.0.1:9090
+	// CertDir persists worker.key / worker.crt / ca.crt (0600 key). Mount the
+	// same volume as token_path. Default /data/mtls.
+	CertDir string `yaml:"cert_dir"`
 }
 
 type LotusConfig struct {
@@ -52,9 +106,9 @@ type CurioConfig struct {
 }
 
 type WinningPostPolicy struct {
-	Enabled       bool `yaml:"enabled"`
+	Enabled        bool `yaml:"enabled"`
 	ResumeDelaySec int  `yaml:"resume_delay_sec"`
-	TimeoutSec    int  `yaml:"timeout_sec"`
+	TimeoutSec     int  `yaml:"timeout_sec"`
 }
 
 type GRPCConfig struct {
@@ -145,6 +199,30 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Curio.ProofMaxWaitSec == 0 {
 		cfg.Curio.ProofMaxWaitSec = 600
+	}
+	if cfg.Gateway.WorkerID == "" {
+		cfg.Gateway.WorkerID = "sp-" + cfg.Lotus.MinerAddress
+	}
+	if cfg.Gateway.TokenPath == "" {
+		cfg.Gateway.TokenPath = "/data/gateway-token.json"
+	}
+	if cfg.Gateway.MTLSFront.InferencePort == 0 {
+		cfg.Gateway.MTLSFront.InferencePort = 8443
+	}
+	if cfg.Gateway.MTLSFront.SchedulerPort == 0 {
+		cfg.Gateway.MTLSFront.SchedulerPort = 9443
+	}
+	if cfg.Gateway.MTLSFront.InferenceBackend == "" {
+		cfg.Gateway.MTLSFront.InferenceBackend = "http://127.0.0.1:8000"
+	}
+	if cfg.Gateway.MTLSFront.SchedulerBackend == "" {
+		cfg.Gateway.MTLSFront.SchedulerBackend = "http://127.0.0.1:9090"
+	}
+	if cfg.Gateway.MTLSFront.CertDir == "" {
+		cfg.Gateway.MTLSFront.CertDir = "/data/mtls"
+	}
+	if cfg.Gateway.GPUCount == 0 {
+		cfg.Gateway.GPUCount = 1
 	}
 	if cfg.Scheduler.WinningPost.ResumeDelaySec == 0 {
 		cfg.Scheduler.WinningPost.ResumeDelaySec = 5

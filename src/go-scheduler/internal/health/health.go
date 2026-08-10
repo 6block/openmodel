@@ -47,7 +47,35 @@ type Server struct {
 	sched      *scheduler.Scheduler
 	logger     *slog.Logger
 	ctx        context.Context
-	token      string // if set, /ready and /debug/* require this Bearer token
+	token      string                                                       // if set, /ready and /debug/* require this Bearer token
+	dynToken   func() string                                                // optional extra accepted token (SP self-registration; rotates)
+	regStatus  func() any                                                   // optional: SP self-registration status for GET /registration
+	reverify   func(ctx context.Context, model string) (int, []byte, error) // optional: relay to the gateway
+	onGwPoll   func()                                                       // optional: called when the GATEWAY polls /ready with its issued token
+}
+
+// SetGatewayPollObserver wires a callback fired when a /ready poll authenticates with
+// the self-registration token — the one signal that proves the gateway still honours
+// this worker's registration. Static-token calls (local ops, curl) are excluded on
+// purpose: they say nothing about the gateway. Call before Start.
+func (s *Server) SetGatewayPollObserver(f func()) {
+	s.onGwPoll = f
+}
+
+// SetRegistrationStatus wires the source for GET /registration, so an SP operator can
+// ask "am I registered, with whom, and if not why" instead of grepping JSON logs or
+// opening the file that holds the token. The provider must return a value that is safe
+// to serialize — no full token. Call before Start; without it the route 404s.
+func (s *Server) SetRegistrationStatus(f func() any) {
+	s.regStatus = f
+}
+
+// SetDynamicToken registers an additional accepted Bearer token source — the
+// per-worker token issued by gateway self-registration, which rotates on every
+// (re-)registration. Auth is considered ENABLED once either a static token or a
+// dynamic source is configured. Call before Start.
+func (s *Server) SetDynamicToken(f func() string) {
+	s.dynToken = f
 }
 
 // NewServer creates a new health/metrics server. token, if non-empty, gates /ready
@@ -69,6 +97,8 @@ func NewServer(port int, sched *scheduler.Scheduler, logger *slog.Logger, ctx co
 
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/ready", s.requireToken(s.handleReady))
+	mux.HandleFunc("/registration", s.requireToken(s.handleRegistration))
+	mux.HandleFunc("/registration/reverify", s.requireToken(s.handleReverify))
 	mux.Handle("/metrics", promhttp.Handler())
 
 	// Debug endpoints — available in all modes; token-gated when configured so they
@@ -86,13 +116,14 @@ func NewServer(port int, sched *scheduler.Scheduler, logger *slog.Logger, ctx co
 	return s
 }
 
-// requireToken wraps a handler so it requires `Authorization: Bearer <token>` when a
-// token is configured. No-op (open) when the token is empty (trusted-LAN mode).
+// requireToken wraps a handler so it requires `Authorization: Bearer <token>` when
+// auth is configured (a static token and/or a dynamic self-registration token).
+// No-op (open) when neither is set (trusted-LAN mode).
 func (s *Server) requireToken(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.token != "" {
+		if s.token != "" || s.dynToken != nil {
 			got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-			if got != s.token {
+			if got == "" || !s.tokenAccepted(got) {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -101,12 +132,42 @@ func (s *Server) requireToken(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// noteGatewayPoll reports a /ready poll made with the self-registration token. It
+// re-checks the header instead of reusing the requireToken result because only the
+// DYNAMIC token identifies the caller as the gateway: a static-token /ready (an
+// operator's curl, a local healthcheck) must never be mistaken for the gateway
+// still holding this worker on its roster.
+func (s *Server) noteGatewayPoll(r *http.Request) {
+	if s.onGwPoll == nil || s.dynToken == nil {
+		return
+	}
+	dt := s.dynToken()
+	if dt == "" {
+		return
+	}
+	if strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")) == dt {
+		s.onGwPoll()
+	}
+}
+
+func (s *Server) tokenAccepted(got string) bool {
+	if s.token != "" && got == s.token {
+		return true
+	}
+	if s.dynToken != nil {
+		if dt := s.dynToken(); dt != "" && got == dt {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleSectorCache(w http.ResponseWriter, r *http.Request) {
 	cache := s.sched.SectorCacheSnapshot()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"sector_cache":    cache,
-		"gpu_state":       s.sched.CurrentState().String(),
+		"sector_cache":     cache,
+		"gpu_state":        s.sched.CurrentState().String(),
 		"active_deadlines": countActive(cache),
 	})
 }
@@ -138,7 +199,57 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok")
 }
 
+// handleRegistration reports this worker's gateway self-registration state. Behind
+// the same token gate as /ready: it names the gateway and payout address, which is
+// operator information, not public. 404 when self-registration was never wired up.
+// SetReverify installs the relay used by POST /registration/reverify.
+func (s *Server) SetReverify(f func(ctx context.Context, model string) (int, []byte, error)) {
+	s.reverify = f
+}
+
+// handleReverify: POST /registration/reverify {"model":"..."} — asks the
+// gateway to re-examine one claimed model right away. The SP talks only to
+// this local port; the worker token stays inside the scheduler.
+func (s *Server) handleReverify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST only"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if s.reverify == nil {
+		http.Error(w, `{"error":"self-registration not configured on this worker"}`, http.StatusNotFound)
+		return
+	}
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Model == "" {
+		http.Error(w, `{"error":"body must be {"model":"<claimed model id>"}"}`, http.StatusBadRequest)
+		return
+	}
+	code, body, err := s.reverify(r.Context(), req.Model)
+	if err != nil {
+		http.Error(w, `{"error":"gateway unreachable: `+err.Error()+`"}`, http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code) // pass the gateway verdict through (200/404/409/429…)
+	_, _ = w.Write(body)
+}
+
+func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
+	if s.regStatus == nil {
+		http.Error(w, `{"error":"self-registration not configured on this worker"}`, http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(s.regStatus()); err != nil {
+		s.logger.Error("failed to encode registration status", "error", err)
+	}
+}
+
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	s.noteGatewayPoll(r)
 	state := s.sched.CurrentState()
 	gpuStateGauge.Set(float64(state))
 

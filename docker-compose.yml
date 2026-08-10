@@ -13,6 +13,7 @@ services:
       - SIDECAR_CONFIG=${SIDECAR_CONFIG:-sidecar-prod-test.yaml}
     volumes:
       - ./config:/etc/sidecar:ro
+      - ./data:/data                    # v1.3: gateway token, TLS certs, tls_ca_path all persist here
       - /tmp/curio.log:/tmp/curio.log:ro
     restart: unless-stopped
     healthcheck:
@@ -38,6 +39,7 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
       - HF_HOME=/root/.cache/huggingface
       - MODEL_CACHE_DIR=/models   # in-container path (shared with foc-bridge)
+      - INFERENCE_API_TOKEN=${INFERENCE_API_TOKEN:-}   # static API token; dynamic per-worker tokens are accepted alongside
     volumes:
       - ./config:/etc/sidecar:ro
       - ${MODEL_CACHE_DIR:-~/openmodel/models}:/models
@@ -72,8 +74,8 @@ services:
       - FOC_PRIVATE_KEY=${FOC_PRIVATE_KEY:-}
       - FOC_RPC_URL=${FOC_RPC_URL:-https://api.calibration.node.glif.io/rpc/v1}
       - FOC_BRIDGE_PORT=${FOC_BRIDGE_PORT:-3100}
-      - SP_URL_PRIMARY=${SP_URL_PRIMARY:-https://caliberation-pdp.infrafolio.com/piece}
-      - SP_URL_SECONDARY=${SP_URL_SECONDARY:-https://calib2.ezpdpz.net/piece}
+      - SP_URL_PRIMARY=${SP_URL_PRIMARY:-https://pdp.lotus.dedyn.io/piece}
+      - SP_URL_SECONDARY=${SP_URL_SECONDARY:-https://pdp.lotus.dedyn.io/piece}
     volumes:
       - ${MODEL_CACHE_DIR:-~/openmodel/models}:/models
     restart: unless-stopped

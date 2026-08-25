@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 _tokenizers: dict = {}
 
 
-def _chat_prompt(engine, messages):
+def _chat_prompt(engine, messages, enable_thinking: bool = False):
     """Render the conversation with the model's own chat template.
 
     The bare "role: content" join below it is kept only for models that ship no
@@ -48,12 +48,128 @@ def _chat_prompt(engine, messages):
             [{"role": m.role, "content": m.content} for m in messages],
             tokenize=False,
             add_generation_prompt=True,
-            # Reasoning models default to a <think> block. The minimal web UI
-            # renders it verbatim and it multiplies answer latency, so serve
-            # direct answers; templates without this variable ignore it.
-            enable_thinking=False,
+            # Default OFF: reasoning models emit a <think> block that multiplies
+            # latency and bills, so direct answers unless the client opts in
+            # (per-request enable_thinking). Templates without this variable
+            # ignore it either way.
+            enable_thinking=enable_thinking,
         )
     return "\n".join(f"{m.role}: {m.content}" for m in messages)
+
+
+class _ThinkSplitter:
+    """Split a thinking-model response "<think>REASONING</think>ANSWER" into
+    (reasoning_delta, content_delta) pairs, tolerating tags that arrive split
+    across stream deltas. Instantiated ONLY when the client asked for thinking:
+    with the flag off the raw text passes through untouched (default JSON
+    responses additionally carry `reasoning_content: null` from the response
+    model — semantically identical; receipts hash the raw text either way).
+
+    The receipt hash is always computed over the RAW generated text — the split
+    is presentation only, so billing attestation is unaffected.
+    """
+
+    OPEN, CLOSE = "<think>", "</think>"
+
+    def __init__(self, pre_opened: bool = False, open_tag: str = None, close_tag: str = None):
+        # gpt-oss (harmony) speaks a different dialect: after special tokens are
+        # stripped the reasoning channel reads "analysis<REASONING>assistantfinal
+        # <ANSWER>" — same machine, different anchors.
+        if open_tag:
+            self.OPEN = open_tag
+        if close_tag:
+            self.CLOSE = close_tag
+        self._buf = ""
+        # Newer Qwen templates (*-2507, 3.8) pre-fill "<think>\n" INSIDE the
+        # generation prompt, so the generated text starts straight in the
+        # reasoning and only ever contains the closing tag. The caller detects
+        # that from the rendered prompt and starts us in the think phase.
+        self._phase = "think" if pre_opened else "seek"  # seek → think → content
+        self._reasoning_started = False  # swallow the newline right after <think>
+        self._content_started = False    # swallow the newline(s) right after </think>
+
+    def feed(self, delta: str) -> tuple[str, str]:
+        reasoning, content = "", ""
+        self._buf += delta
+        if self._phase == "seek":
+            probe = self._buf.lstrip()
+            if not probe:
+                return "", ""
+            if probe.startswith(self.OPEN):
+                self._buf = probe[len(self.OPEN):]
+                self._phase = "think"
+            elif self.OPEN.startswith(probe):
+                return "", ""  # still might become the tag; keep buffering
+            else:
+                content, self._buf = self._buf, ""
+                self._phase = "content"
+                return "", content
+        if self._phase == "think":
+            if not self._reasoning_started:
+                self._buf = self._buf.lstrip("\n")
+            i = self._buf.find(self.CLOSE)
+            if i >= 0:
+                reasoning = self._buf[:i].rstrip("\n")
+                self._buf = self._buf[i + len(self.CLOSE):].lstrip("\n")
+                self._phase = "content"
+                if reasoning:
+                    self._reasoning_started = True
+            else:
+                # Emit all but a tail that could be a split closing tag. Trailing
+                # newlines stay buffered too: they may turn out to precede the
+                # closing tag, and once emitted they cannot be taken back.
+                keep = len(self.CLOSE) - 1
+                if len(self._buf) > keep:
+                    emit = self._buf[:-keep]
+                    stripped = emit.rstrip("\n")
+                    self._buf = emit[len(stripped):] + self._buf[-keep:]
+                    reasoning = stripped
+                if reasoning:
+                    self._reasoning_started = True
+                return reasoning, ""
+        if self._phase == "content":
+            chunk = self._buf
+            self._buf = ""
+            if not self._content_started:
+                chunk = chunk.lstrip("\n")
+            if chunk:
+                self._content_started = True
+            content += chunk
+        return reasoning, content
+
+    def flush(self) -> tuple[str, str]:
+        """Return whatever is still buffered (truncated generations)."""
+        buf, self._buf = self._buf, ""
+        if self._phase == "think":
+            # A truncated generation may end mid-way through the closing tag;
+            # that half-written tag is markup, not reasoning.
+            for k in range(min(len(buf), len(self.CLOSE) - 1), 0, -1):
+                if self.CLOSE.startswith(buf[-k:]):
+                    buf = buf[:-k]
+                    break
+            return buf.rstrip("\n"), ""
+        if not self._content_started:
+            buf = buf.lstrip("\n")
+        return "", buf
+
+
+def _split_completed(text: str, splitter, want_thinking: bool) -> tuple[str | None, str]:
+    """Split a finished generation into (reasoning_content, content).
+
+    Reasoning is withheld from a request that did not ask for it — except when
+    the generation ran out of budget inside the reasoning channel and never
+    produced an answer. Withholding it there would return an entirely empty
+    response for tokens the caller is billed for, so it is surfaced instead;
+    finish_reason ("length") tells them why it stopped there.
+    """
+    if splitter is None:
+        return None, text
+    r1, c1 = splitter.feed(text)
+    r2, c2 = splitter.flush()
+    reasoning, content = r1 + r2, c1 + c2
+    if want_thinking:
+        return (reasoning or None), content
+    return (reasoning if reasoning and not content else None), content
 
 
 def _engine_session_key(http_request, messages=None, prompt=None):
@@ -92,6 +208,9 @@ def _is_context_length_error(e: Exception) -> bool:
 class ChatMessage(BaseModel):
     role: str
     content: str
+    # Present on assistant RESPONSES when thinking was requested; ignored (and
+    # never re-rendered into the prompt) when a client echoes it back in history.
+    reasoning_content: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -105,6 +224,13 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = Field(default=0.95, gt=0.0, le=1.0)
     stop: str | list[str] | None = None
     stream: bool = False
+    # Thinking mode (opt-in, default OFF — answers, latency and bills stay as
+    # they are unless a client asks). `enable_thinking` is the direct switch;
+    # `chat_template_kwargs: {"enable_thinking": true}` is accepted as the
+    # OpenAI-ecosystem spelling of the same thing. Models whose template has no
+    # such variable (gpt-oss, Qwen2.5) silently ignore it.
+    enable_thinking: bool = False
+    chat_template_kwargs: dict | None = None
     # GATEWAY-INTERNAL (B2 stream resume): text already delivered to the client by a
     # previous worker whose generation was interrupted (mining yield / crash). It is
     # appended VERBATIM to the rendered prompt so the engine continues exactly where
@@ -324,7 +450,27 @@ def create_app(engine: InferenceEngine, model_manager=None,
                 headers={"Retry-After": _retry_after_for_state(status.state)},
             )
 
-        prompt = _chat_prompt(engine, request.messages)
+        want_thinking = bool(request.enable_thinking or
+                             (request.chat_template_kwargs or {}).get("enable_thinking"))
+        prompt = _chat_prompt(engine, request.messages, enable_thinking=want_thinking)
+        # Template dialects differ: older Qwen3 models GENERATE "<think>…</think>"
+        # themselves, newer templates pre-fill the opening tag in the prompt and
+        # the generation starts inside the reasoning. Detect which one we got.
+        think_pre_opened = want_thinking and prompt.rstrip().endswith(_ThinkSplitter.OPEN)
+        # gpt-oss ALWAYS emits its harmony analysis channel — there is no off
+        # switch in the template — so its output must be split on every request:
+        # default requests keep only the final answer (the analysis is dropped),
+        # thinking requests surface it as reasoning_content. Keyed on the model
+        # (not a text heuristic): an ordinary answer may legitimately start with
+        # the word "analysis".
+        is_harmony = "gpt-oss" in (engine.current_model or "")
+
+        def _make_splitter():
+            if is_harmony:
+                return _ThinkSplitter(open_tag="analysis", close_tag="assistantfinal")
+            if want_thinking:
+                return _ThinkSplitter(pre_opened=think_pre_opened)
+            return None
         # B2 stream resume: continue EXACTLY from the text a previous worker already
         # delivered — vLLM generates the sequel of the prompt string, so appending the
         # delivered prefix verbatim (no separator) resumes mid-sentence seamlessly.
@@ -348,6 +494,12 @@ def create_app(engine: InferenceEngine, model_manager=None,
             async def sse_generator():
                 gen_parts = []
                 final_usage = None
+                splitter = _make_splitter()
+                # Reasoning withheld from a default request, kept only so that a
+                # stream that never reaches an answer can hand it back at the
+                # end instead of delivering nothing at all.
+                withheld_reasoning = []
+                sent_content = False
                 try:
                     async for chunk in engine.generate_stream(prompt, session_key=session_key, **gen_kwargs):
                         if chunk.finish_reason is not None:
@@ -366,16 +518,61 @@ def create_app(engine: InferenceEngine, model_manager=None,
                                 },
                             }
                         else:
+                            delta = {"content": chunk.text_delta}
+                            if splitter is not None:
+                                r, c = splitter.feed(chunk.text_delta)
+                                if chunk.text_delta:
+                                    gen_parts.append(chunk.text_delta)
+                                if not r and not c:
+                                    continue  # buffering a possibly-split tag
+                                delta = {}
+                                if r:
+                                    if want_thinking:
+                                        delta["reasoning_content"] = r
+                                    else:
+                                        withheld_reasoning.append(r)
+                                if c:
+                                    delta["content"] = c
+                                    sent_content = True
+                                if not delta:
+                                    continue  # harmony analysis withheld on a default request
                             data = {
                                 "id": completion_id,
                                 "object": "chat.completion.chunk",
                                 "created": created,
                                 "model": request.model,
-                                "choices": [{"index": 0, "delta": {"content": chunk.text_delta}, "finish_reason": None}],
+                                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                             }
                         if chunk.finish_reason is not None:
+                            if splitter is not None:
+                                r, c = splitter.flush()
+                                tail = {}
+                                if r:
+                                    if want_thinking:
+                                        tail["reasoning_content"] = r
+                                    else:
+                                        withheld_reasoning.append(r)
+                                if c:
+                                    tail["content"] = c
+                                    sent_content = True
+                                if not sent_content and withheld_reasoning:
+                                    # The budget ran out inside the reasoning
+                                    # channel: no answer text ever arrived. Send
+                                    # the withheld reasoning rather than closing
+                                    # a stream that delivered nothing, for tokens
+                                    # the caller is billed for.
+                                    tail["reasoning_content"] = "".join(withheld_reasoning)
+                                if tail:
+                                    frame = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": request.model,
+                                        "choices": [{"index": 0, "delta": tail, "finish_reason": None}],
+                                    }
+                                    yield f"data: {json.dumps(frame)}\n\n"
                             final_usage = (chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens)
-                        elif chunk.text_delta:
+                        elif splitter is None and chunk.text_delta:
                             gen_parts.append(chunk.text_delta)
                         yield f"data: {json.dumps(data)}\n\n"
                     # A1: attest the completed stream (delivered text + reported usage)
@@ -433,11 +630,17 @@ def create_app(engine: InferenceEngine, model_manager=None,
         response.headers["X-OM-Receipt"] = base64.b64encode(
             json.dumps(rcpt, separators=(",", ":")).encode()).decode()
 
+        # Thinking split is presentation-only: the receipt above hashed the RAW
+        # text; with the flag off the text is untouched (the JSON does gain a
+        # null reasoning_content field from the response model).
+        reasoning_out, content_out = _split_completed(text, _make_splitter(), want_thinking)
+
         return CompletionResponse(
             model=request.model,
             choices=[
                 Choice(
-                    message=ChatMessage(role="assistant", content=text),
+                    message=ChatMessage(role="assistant", content=content_out,
+                                        reasoning_content=reasoning_out),
                     finish_reason=finish_reason,
                 )
             ],

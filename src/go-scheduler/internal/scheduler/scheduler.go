@@ -109,6 +109,12 @@ func (s *Scheduler) Run(ctx context.Context, pollInterval time.Duration) {
 
 	if s.policy.WinningPost.Enabled {
 		go s.monitorWinningPost(ctx)
+	} else {
+		// A miner without this loses block rewards whenever a win lands while
+		// the GPU is busy. Deliberate opt-outs exist, so WARN rather than fail —
+		// but never skip silently.
+		s.logger.Warn("WinningPoSt monitoring DISABLED (scheduler.winning_post.enabled is false/absent) — " +
+			"a block win during inference can miss its proof window")
 	}
 
 	<-ctx.Done()

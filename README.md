@@ -16,10 +16,12 @@ settlement smart contract and billing verifier live in
 ```
 openmodel/
 ├── README.md               # This document (deployment guide)
-├── UPDATE-NOTES.md         # What changed in v1.3.0 (read before upgrading)
+├── ONBOARDING-ALPHA.md     # Join the hosted mainnet alpha as a provider
+├── SP-GUIDE.md             # Day-2 operations: status, earnings, withdrawal, rules
+├── UPDATE-NOTES.md         # Release update notes (read before upgrading)
 ├── docker-compose.yml      # Compose file (pre-built images)
 ├── .env.example            # Environment variable template
-├── config/                 # Scenario configs (single GPU / 8-GPU / FOC download)
+├── config/                 # Scenario configs (single GPU / 8-GPU / FOC / mainnet alpha)
 ├── src/                    # Source code (go-scheduler, py-inference, foc-bridge, proto)
 └── release/                # Staging area for image tarballs (uploaded to GitHub Releases)
 ```
@@ -57,9 +59,10 @@ cp .env.example .env       # set LOTUS_API_TOKEN, SIDECAR_CONFIG, MODEL_CACHE_DI
 
 # 3. Pick a scenario config (config/, selected via SIDECAR_CONFIG)
 #    sidecar-prod-test.yaml    single GPU (default)
-#    sidecar-8gpu-multi.yaml   8 GPUs, one engine per GPU (3–7B models, max throughput)
-#    sidecar-8gpu-tensor.yaml  8 GPUs, tensor parallel (14B+ models)
+#    sidecar-8gpu-multi.yaml   8 GPUs, one engine per GPU (small models, max throughput)
+#    sidecar-8gpu-tensor.yaml  8 GPUs, tensor parallel (models too big for one card)
 #    sidecar-foc.yaml          single GPU, weights fetched from a Filecoin SP
+#    sidecar-mainnet-alpha.yaml join the hosted mainnet alpha (see ONBOARDING-ALPHA.md)
 
 # 4. (Optional but recommended) Fill in the gateway block — see next section
 
@@ -83,7 +86,7 @@ curl http://localhost:8000/v1/chat/completions \
 The network bills per model, so the servable set is a **fixed catalog** — and
 which catalog entries a worker offers is the SP's own choice, declared in
 `gateway.supported_models` and proven per entry by the admission probe before
-any traffic routes to it. The v1 catalog (four entries, one family as the
+any traffic routes to it. The v1 catalog (five entries, one family as the
 backbone, context capped at 32k):
 
 | canonical-id | HF repo | quant | weights | local path under /models | typical hardware |
@@ -92,6 +95,7 @@ backbone, context capped at 32k):
 | `qwen3-8b` | Qwen/Qwen3-8B | fp16 | ~16 GB | `Qwen--Qwen3-8B` | 1× 24 GB, or 4× 10 GB (TP=4) |
 | `gpt-oss-20b` | openai/gpt-oss-20b | mxfp4 (native) | ~13 GB | `openai--gpt-oss-20b` | 1× 24 GB, or 2–4× 10 GB |
 | `qwen3-32b` | Qwen/Qwen3-32B-AWQ | awq-int4 | ~19 GB | `Qwen--Qwen3-32B-AWQ` | 1× 24 GB (tight), 4–8× 10 GB (TP) |
+| `qwen3.8-27b` | Qwen/Qwen3.8-27B-FP8 | fp8 (Marlin W8A16 on Ampere) | ~28 GB | `Qwen--Qwen3.8-27B-FP8` | 8× 10 GB (TP=8) |
 
 Rules that keep the catalog honest:
 
@@ -99,8 +103,8 @@ Rules that keep the catalog honest:
   listed; a same-name different-quant deployment fails its verification.
 - **Claiming is not serving.** Every entry you list in `supported_models` gets
   probed (load + capability) before the gateway routes real traffic to it, and
-  is re-checked periodically afterwards.
-  set `HF_TOKEN` before first download.
+  is re-checked periodically afterwards. Gated HF repos (none in the current
+  catalog) would additionally need `HF_TOKEN` set before first download.
 - On 10 GB-class cards the 32k context is tight (tensor-parallel + eager mode
   required); 24 GB-class cards are comfortable. Smaller `max_model_len`
   configurations are a per-SP choice.
@@ -114,25 +118,26 @@ Fill in the `gateway:` block of your chosen sidecar config:
 gateway:
   url: https://<gateway-host>:<port>   # https strongly recommended over public networks
   gateway_id: <the gateway's advertised id>   # TLS identity of the gateway (not its address)
-  worker_id: my-sp-worker-1            # 1–64 chars, alphanumeric / - _
+  worker_id: my-sp-worker-1            # 1–64 chars, starts alphanumeric, then letters/digits/._-
   payout_address: "0x…"                # EVM address your earnings settle to
   public_endpoint: https://<this-host>:38443       # your inference TLS front, as the gateway reaches it
   public_scheduler_url: https://<this-host>:39443  # your scheduler TLS front
   gpu_count: 8
   supported_models:                    # everything you can serve; entries absent on disk are prefetched at start-up
-    - "/models/Qwen--Qwen2.5-3B-Instruct"
+    - "/models/Qwen--Qwen3-4B-Instruct-2507"
   auto_register: true
   # token_path is WRITTEN BY the scheduler (the issued token persists here, 0600)
   # — nothing to prepare. tls_ca_path is the one file YOU place: the CA
   # certificate from your gateway operator's onboarding materials; needed only
   # for the very first registration over https (afterwards the cert store's CA
   # is trusted). Both live under ./data on the host (see docker-compose.yml).
-  # Note: this CA is the worker network's identity layer, not a stopgap — even
-  # when the gateway serves the public under a real domain certificate, the
-  # worker directions keep this CA (identities are worker_id/gateway_id,
-  # decoupled from any address or domain).
+  # Note: this CA is the identity layer of the gateway→worker direction (the
+  # mTLS front below) regardless of how the gateway is fronted. For the
+  # worker→gateway direction it is one of two trust modes — see tls_system_ca.
   token_path: /data/gateway-token.json
   tls_ca_path: /data/gateway-ca.crt
+  # Gateway on a public domain with a real certificate? Drop tls_ca_path and
+  # set tls_system_ca: true instead — system trust store, no CA file to place.
   mtls_front:
     enabled: true
     cert_dir: /data/mtls
@@ -191,7 +196,7 @@ curl -s -H "Authorization: Bearer $SCHEDULER_TOKEN" http://127.0.0.1:9090/regist
   ```bash
   curl -s -X POST -H "Authorization: Bearer $SCHEDULER_TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"model":"/models/Qwen--Qwen2.5-3B-Instruct"}' \
+    -d '{"model":"/models/Qwen--Qwen3-4B-Instruct-2507"}' \
     http://127.0.0.1:9090/registration/reverify
   ```
 
@@ -244,7 +249,8 @@ docker build -t openmodel-foc-bridge:latest src/foc-bridge
 ```
 
 Note: build the inference image on an x86_64 host with NVIDIA tooling; the
-resulting image is ~13 GB (CUDA 13 + PyTorch + vLLM 0.22).
+resulting image is ~17 GB (CUDA 13 + PyTorch + vLLM 0.22); on GitHub
+Releases it ships gzip-compressed as six ~1.5 GB split volumes.
 
 ## Troubleshooting
 
@@ -269,7 +275,12 @@ resulting image is ~13 GB (CUDA 13 + PyTorch + vLLM 0.22).
 
 ## Versions
 
-- **v1.3.0** (this release): see UPDATE-NOTES.md.
+- **v1.4.0** (this release): per-request thinking mode
+  (`enable_thinking` → `reasoning_content`), `qwen3.8-27b` catalog entry,
+  `tls_system_ca` domain trust mode for worker→gateway, `init: true` in the
+  compose file (PID-1 zombie protection), config templates rebuilt around the
+  production catalog, fail-fast on engine-shape config errors.
+- v1.3.0: see UPDATE-NOTES.md.
 - v1.2.0: per-worker auth, signed billing receipts, stream continuation,
   weight integrity, predictive readiness.
 - v1.1.1: accurate token accounting, SSE streaming fixes, multi-partition

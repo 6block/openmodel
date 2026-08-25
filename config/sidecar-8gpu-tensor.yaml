@@ -42,13 +42,13 @@ grpc:
 
 # AI Inference engine — single vLLM engine across 8 GPUs (tensor parallel)
 # Available models (by VRAM requirement, ascending):
-#   Qwen/Qwen2.5-14B-Instruct     — fp16 ~28GB, fits easily on 8 GPUs
+#   Qwen/Qwen3-32B-AWQ            — awq-int4 ~19GB, the production 32B entry
 #   Qwen/Qwen2.5-72B-Instruct-AWQ — AWQ quantized ~40GB, runs on 8 GPUs
 inference:
   engine: "vllm"
-  model: "Qwen/Qwen2.5-14B-Instruct"
+  model: "Qwen/Qwen3-32B-AWQ"   # production-catalog entry (qwen3-32b), one engine across all cards
   gpu_memory_utilization: 0.90
-  max_model_len: 4096
+  max_model_len: 8192
   enforce_eager: true   # Disable CUDA graphs to save VRAM
   api_port: 8000
 
@@ -90,6 +90,8 @@ logging:
 #   auto_register: true                           # false = only manual trigger via -register-only
 #   # worker_id: sp-<your-miner-id>               # optional; defaults to "sp-" + miner address
 #   # gpu_count: 8                                # optional; corrected from live engine count after the first poll
+#   # (commented samples below predate the 27B entry — see
+#   #  sidecar-mainnet-alpha.yaml for the current 5-model catalog)
 #   supported_models:              # production catalog v1 — claim what you can serve;
 #     - "/models/Qwen--Qwen3-4B-Instruct-2507"   # qwen3-4b   fp16  ~8G   (1x24G, or TP=2 on 10G cards)
 #     - "/models/Qwen--Qwen3-8B"                 # qwen3-8b   fp16  ~16G  (1x24G, or TP=4 on 10G cards)

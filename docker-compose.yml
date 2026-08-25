@@ -25,6 +25,10 @@ services:
   inference:
     image: openmodel-inference:latest
     container_name: openmodel-inference
+    # tini as PID 1: forwards stop signals and reaps exited children.
+    # Without it a lingering engine subprocess can leave the main process
+    # a zombie, and the container can no longer be stopped or recreated.
+    init: true
     network_mode: host
     logging:
       driver: "json-file"
@@ -64,6 +68,10 @@ services:
   foc-bridge:
     image: openmodel-foc-bridge:latest
     container_name: openmodel-foc-bridge
+    # tini as PID 1: forwards stop signals and reaps exited children.
+    # Without it a lingering engine subprocess can leave the main process
+    # a zombie, and the container can no longer be stopped or recreated.
+    init: true
     network_mode: host
     logging:
       driver: "json-file"
@@ -72,7 +80,7 @@ services:
         max-file: "3"
     environment:
       - FOC_PRIVATE_KEY=${FOC_PRIVATE_KEY:-}
-      - FOC_RPC_URL=${FOC_RPC_URL:-https://api.calibration.node.glif.io/rpc/v1}
+      - FOC_RPC_URL=${FOC_RPC_URL:-https://api.node.glif.io/rpc/v1}
       - FOC_BRIDGE_PORT=${FOC_BRIDGE_PORT:-3100}
       - SP_URL_PRIMARY=${SP_URL_PRIMARY:-https://pdp.lotus.dedyn.io/piece}
       - SP_URL_SECONDARY=${SP_URL_SECONDARY:-https://pdp.lotus.dedyn.io/piece}

@@ -24,7 +24,8 @@ template rendering) that noticeably improves answer quality.
   `Assistant:` markers, or (Qwen3-class models) leaking raw `<think>` blocks.
   If you had client-side workarounds for those artifacts, they are no longer
   needed. Reasoning-model "thinking" is disabled at the template level for
-  direct, fast answers.
+  direct, fast answers. (Since superseded on main: thinking is now a
+  per-request opt-in via `enable_thinking`, still off by default.)
 
 ## New: self-registration (worker → gateway)
 
@@ -95,7 +96,7 @@ which is normal when a gateway raises its admission floor.
   ```bash
   curl -s -X POST -H "Authorization: Bearer $SCHEDULER_TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"model":"/models/Qwen--Qwen2.5-3B-Instruct"}' \
+    -d '{"model":"/models/Qwen--Qwen3-4B-Instruct-2507"}' \
     http://127.0.0.1:9090/registration/reverify
   ```
 
@@ -106,9 +107,10 @@ which is normal when a gateway raises its admission floor.
 
 Four entries, declared per-SP via `gateway.supported_models` and verified per
 entry before routing (see the catalog section in README): `qwen3-4b`,
-`qwen3-8b`, `gpt-oss-20b`, `qwen3-32b`. Quantisation is pinned per entry;
-context is capped at 32k network-wide. All four entries are probe-verified on
-network hardware at release.
+`qwen3-8b`, `gpt-oss-20b`, `qwen3-32b` — as of this v1.3.0 release; a fifth
+entry, `qwen3.8-27b`, was added later on main. Quantisation is pinned per
+entry; context is capped at 32k network-wide. All four entries are
+probe-verified on network hardware at release.
 
 ## Fixes
 
@@ -136,5 +138,5 @@ network hardware at release.
 - Compatible gateway: openmodel-gateway v2.1+ (self-registration, certificate
   issuance, admission probes). Against older gateways the worker still serves
   with a static token; the new surfaces stay dormant.
-- Images: `openmodel-scheduler` ~28 MB, `openmodel-inference` ~13 GB (CUDA 13 +
+- Images: `openmodel-scheduler` ~28 MB, `openmodel-inference` ~17 GB (CUDA 13 +
   PyTorch + vLLM 0.22), `openmodel-foc-bridge` ~253 MB.

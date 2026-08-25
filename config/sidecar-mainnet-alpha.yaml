@@ -10,39 +10,55 @@ lotus:
   miner_address: ""            # <<< miner id, e.g. t01234 / f01234
 
 curio:
-  db_host: "127.0.0.1"
-  db_port: 5433
-  db_user: "yugabyte"
-  db_password: "yugabyte"
-  db_name: "yugabyte"
+  # One DSN string (split db_host/db_port keys do not exist in the config
+  # struct; YAML drops unknown keys silently — with them, proof detection and
+  # WinningPoSt monitoring stay OFF without any warning).
+  dsn: "host=localhost port=5433 user=yugabyte dbname=yugabyte sslmode=disable search_path=curio"
+  proof_poll_interval_sec: 5
+  proof_max_wait_sec: 1800
   log_path: "/tmp/curio.log"
 
 scheduler:
-  poll_interval_sec: 15
-  yield_before_windowpost_sec: 300
-  grpc_port: 50051
+  window_post:
+    graceful_yield_threshold_sec: 300
+    hard_stop_threshold_sec: 120
+    resume_delay_after_close_sec: 60
+    yield_during_fault_cutoff: false
+    proof_detection_enabled: true
+  winning_post:
+    enabled: true            # block wins yield the GPU immediately (proof has seconds)
+    resume_delay_sec: 30
+    timeout_sec: 35
+  fail_safe_on_disconnect: true
+
+grpc:
+  port: 50051
 
 inference:
   engine: "vllm"
-  model: "/models/Qwen--Qwen3-4B-Instruct-2507"   # <<< one catalog entry; must also be listed in gateway.supported_models
+  model: "/models/Qwen--Qwen3-4B-Instruct-2507"   # boot model (smallest, fastest first serve); other claimed entries load on demand
   api_port: 8000
-  gpu_memory_utilization: 0.93
-  # 4B fp16 on a 10 GB card leaves ~1.04 GiB for the KV cache; 8192 tokens
-  # need 1.12 GiB and the engine refuses to start. 24 GB cards can go to 32768.
-  max_model_len: 4096
-  enforce_eager: true
+  # Defaults match the reference fleet shape: 8x 10 GB cards (e.g. RTX 3080) as
+  # ONE tensor-parallel engine — the only 10 GB shape that serves the FULL
+  # five-model catalog (27B and 32B need tp=8 there). Different hardware: trim
+  # gateway.supported_models per the onboarding guide's model table and resize
+  # here to match — e.g. one 24 GB card: gpu_count 1, device_ids [0], drop 27B;
+  # a single 10 GB card: 4B only, max_model_len 4096, gpu_memory_utilization 0.93.
+  gpu_memory_utilization: 0.90
+  max_model_len: 8192
+  enforce_eager: true          # required for the big entries on 10 GB cards (skips CUDA graphs, saves VRAM)
   multi_gpu:
     mode: "tensor_parallel"
-    gpu_count: 1               # <<< number of GPUs for tensor parallel
-    device_ids: [0]
+    gpu_count: 8               # <<< set to your GPU count
+    device_ids: [0, 1, 2, 3, 4, 5, 6, 7]   # <<< and the matching device ids
 
 # --- Gateway (mainnet alpha) — prefilled; edit only the "<<<" fields ---
 gateway:
-  url: https://36.189.235.195:18020
+  url: https://openmodel.filfox.info
   gateway_id: openmodel-mainnet
   auto_register: true
 
-  worker_id: ""                # <<< 1-64 chars [A-Za-z0-9_-], e.g. sp-alpha-01
+  worker_id: ""                # <<< 1-64 chars, starts alphanumeric, then [A-Za-z0-9._-]; e.g. sp-alpha-01
   payout_address: ""           # <<< EVM address earnings settle to (0x…)
 
   # Gateway-facing addresses of this worker's two TLS fronts. Ports here are
@@ -54,14 +70,21 @@ gateway:
   # disk are fetched automatically (boot model at first start, the rest in the
   # background) through the FOC registry below. Claim what your hardware can
   # actually serve — every entry is probed before real traffic routes to it.
+  # Default: claim the FULL production catalog. Trim to what your hardware can
+  # actually serve (see the model table in the onboarding guide) — every claimed
+  # entry is downloaded to disk, and a claim your engine shape cannot load fails
+  # its switch with a clean error.
   supported_models:
-    - "/models/Qwen--Qwen3-4B-Instruct-2507"   # qwen3-4b    fp16  ~8G
-    # - "/models/Qwen--Qwen3-8B"               # qwen3-8b    fp16  ~16G
-    # - "/models/openai--gpt-oss-20b"          # gpt-oss-20b mxfp4 ~13G
-    # - "/models/Qwen--Qwen3-32B-AWQ"          # qwen3-32b   awq   ~19G
+    - "/models/Qwen--Qwen3-4B-Instruct-2507"   # qwen3-4b    fp16  ~8G   1x24G or 2x10G
+    - "/models/Qwen--Qwen3-8B"                 # qwen3-8b    fp16  ~16G  1x24G or 4x10G
+    - "/models/openai--gpt-oss-20b"            # gpt-oss-20b mxfp4 ~13G  1x24G or 2-4x10G
+    - "/models/Qwen--Qwen3-32B-AWQ"            # qwen3-32b   awq   ~19G  1x24G (tight) or 4-8x10G
+    - "/models/Qwen--Qwen3.8-27B-FP8"          # qwen3.8-27b fp8   ~28G  8x10G (tp=8)
 
   token_path: /data/gateway-token.json   # written by the scheduler on registration
-  tls_ca_path: /data/gateway-ca.crt      # gateway CA from the onboarding materials
+  # The gateway URL above is a real domain behind a publicly-trusted
+  # certificate, so the system trust store validates it — no CA file to place:
+  tls_system_ca: true
 
   mtls_front:
     enabled: true
@@ -76,6 +99,8 @@ foc:
     # Mainnet piece-CID registry for the production catalog. Keys are HF ids;
     # path-form claims (/models/Org--Name) resolve to the same entries. CID
     # order is upload order — parts are concatenated in this exact order.
+    # (sha256 digests for 8B/20B/32B/27B pending — pinned at the next
+    #  module-download verification, same as the 4B precedent below)
     piece_cid_registry:
       "Qwen/Qwen3-4B-Instruct-2507":
         cids:
@@ -147,6 +172,35 @@ foc:
           - "bafkzcibfqcaiaoqz6fudlq7qogj7wqstfh2mvhp2xhfbptovvycuqvhdh5pqx2splyga"
           - "bafkzcibfqcaiaoqzhmizexgyeccyeorxvn3omvjjzbsx6drzcciiw6ialxg7ia7fqmdq"
           - "bafkzcibfsxa5kbqvyx32sgq6w7w6h6xe67l5q7tpifwuh2oihpua2q6l2szgpfndpeza"
+      "Qwen/Qwen3.8-27B-FP8":
+        cids:
+          - "bafkzcibfqcaiaoqzszvked2devfmp3fp3k5p5psioviujxjkd5wy4v5lejia37fnuy5q"
+          - "bafkzcibfqcaiaoqz46agessbja6mw6fvz73vqcfyndsjshzvc6lgqxnyt3el4t64dmea"
+          - "bafkzcibfqcaiaoqzzdmsotmqrmmxvbhpepsqxcyxpyyrzgifcbw4uvfno32lhxhkiuqa"
+          - "bafkzcibfqcaiaoqzhvzy4unzehmtsex4xwqcabt7jjddqjaj3bjc5kreolinhlk444mq"
+          - "bafkzcibfqcaiaoqzytt7b4yjwccrnrypj5w4rlzolwkgv3n3wnigv5dc4d4jkny3zajq"
+          - "bafkzcibfqcaiaoqzggbtkn6strdflxwdc7zvrdx7k3jbhizgnen4xb5yv6tuy5yhzita"
+          - "bafkzcibfqcaiaoqzq7ox3x7kkvbq43zpg2vuua2vaizugdzhdd3rqkoumz6fdgigqezq"
+          - "bafkzcibfqcaiaoqzrez6nutjdqddymtfsncqxahrapy6bs7jlrcytv2cx5b5ygwnpm2q"
+          - "bafkzcibfqcaiaoqzbjsld55os6kx2zjb4l62yyueh3nm7oxukkmqlrdusxrmygfbpuma"
+          - "bafkzcibfqcaiaoqzqxmj4rant3tffp7364bv2ultcv2bomh57cwi7nveahzn73i2gija"
+          - "bafkzcibfqcaiaoqzindg6rrwpxt64cr7zctzrjroevq2lkhvzgi4t7g5nrsknnbs4uba"
+          - "bafkzcibfqcaiaoqzeb7eqhc2eqhl36ulnm6soa5tgqdqtcn5so4dq3kbv4t5p67c6q6a"
+          - "bafkzcibfqcaiaoqzi3keoawbrb64j6wla6wpal5d6l7ncbhvbvojy24unueqtfo72ayq"
+          - "bafkzcibfqcaiaoqzptspsnzyvb35tzfbcnv6da3en3ilwgomu4rzosb3i5tr5c6stira"
+          - "bafkzcibfqcaiaoqzaamopmssikxiev4qj4ndxtpxtk7vg5nsenxnwmkue27chm27beea"
+          - "bafkzcibfqcaiaoqz76plmgea2774nbddxcaqguoho65qfco6sidyypjpybxt2bzgraga"
+          - "bafkzcibfqcaiaoqzd2up7bh63uawpr3xfv4b2ru5ynx2y5tz35bjbo6oyw2yn5op4udq"
+          - "bafkzcibfqcaiaoqzam273iuoo7dmhbx7vfme2ojxfuf3venre7ntuovkby3nsz262yyq"
+          - "bafkzcibfqcaiaoqz5udrqk7y3fbtbl34nq3clekdlslircxarl3jqoiop5jltgrg2ezq"
+          - "bafkzcibfqcaiaoqzmtwjgq52gpyhrdyfwrm6ubx4lq6sb34mij2s6yugg53wxmqvxucq"
+          - "bafkzcibfqcaiaoqztp6pk3xfwkij2quwdyrdj5o2fc3b2fg2kintvojtx7zt3jwt2qna"
+          - "bafkzcibfqcaiaoqziuj35vyzetrmscbjx2u3g7qp72szmrvxivrj2jf7eaug7ef4em3q"
+          - "bafkzcibfqcaiaoqzjuseqkb6hut22jir5mrv2kuxfiovntscuy4znpklf4xywowxzqoa"
+          - "bafkzcibfqcaiaoqzz2l72nijxl63fnat6wgnjza3ep3jcba47suyehnl4ky6jhpaiaha"
+          - "bafkzcibfqcaiaoqzp7vniqfdffqn2v7ujirqzu6cdpk4f3trl5linggemummfeq4h4ma"
+          - "bafkzcibfqcaiaoqzmnaouxofvmhgl5yqfuyqhtranx42bvhdlp62erwrjgpanr5gvyua"
+          - "bafkzcibgwsy7jfqbdg7przburxjhirdiyq3lzyuye2a45xd7qngvvzliatoa6arungcco"
       "Qwen/Qwen3-32B-AWQ":
         cids:
           - "bafkzcibfqcaiaoqzw3fsq6pldscbt6p3vkravhn7uoptifa3m6xvpj5l5426hvww4uxa"

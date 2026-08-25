@@ -428,6 +428,24 @@ class VLLMEngine(InferenceEngine):
 
             except Exception as e:
                 last_error = e
+                if self._is_config_error(e):
+                    # Deterministic config rejection (e.g. "attention heads (12)
+                    # must be divisible by tensor parallel size (8)"): retrying
+                    # cannot help, and the process-restart fallback below would
+                    # kill every live connection over a request that can NEVER
+                    # succeed on this engine shape. Park the engine back in
+                    # PAUSED **before** raising — the rollback path calls
+                    # resume(), and from any half-way state that call returns
+                    # as an idempotent no-op, turning the rollback into a fake
+                    # success with the engine wedged in "loading" forever
+                    # (observed live). Then raise: switch_model rolls back and
+                    # the client gets a clean HTTP error.
+                    logger.error("model rejected by engine config, not retrying: %s", e)
+                    self._engine = None
+                    async with self._transition_lock:
+                        self._pending_pause = None
+                        self._state = EngineState.PAUSED
+                    raise
                 if attempt < max_attempts:
                     logger.warning("reload attempt %d/%d failed: %s — retrying in %.0fs",
                                    attempt, max_attempts, e, retry_delay)
@@ -630,6 +648,15 @@ class VLLMEngine(InferenceEngine):
         # _accepting goes False while a model switch drains this engine:
         # no NEW requests are routed here, but in-flight ones finish normally.
         return self._state == EngineState.RUNNING and self._accepting
+
+    @staticmethod
+    def _is_config_error(e: BaseException) -> bool:
+        """A pydantic/ValueError from engine construction: the model cannot run
+        with the CURRENT engine shape (tp size, quantization, …) — a permanent
+        property of the (model, config) pair, not a transient GPU condition."""
+        if isinstance(e, ValueError):
+            return True
+        return e.__class__.__name__ == "ValidationError"
 
     @staticmethod
     def _is_engine_dead_error(e: BaseException) -> bool:

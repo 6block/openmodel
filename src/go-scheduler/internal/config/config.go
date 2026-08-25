@@ -43,8 +43,15 @@ type GatewayRegConfig struct {
 	// CA certificate, distributed with onboarding materials. Once a registration
 	// succeeds the cert store holds the same CA, so this matters mainly for the
 	// very first (cold) registration.
-	TLSCAPath    string `yaml:"tls_ca_path"`
-	AutoRegister bool   `yaml:"auto_register"`
+	TLSCAPath string `yaml:"tls_ca_path"`
+	// TLSSystemCA switches the https gateway.url to PUBLIC trust: the system
+	// certificate store validates the chain and the URL's hostname is the
+	// expected identity — exactly like any ordinary HTTPS client. For gateways
+	// served on a real domain behind a publicly-trusted certificate; no CA file
+	// to distribute. Mutually exclusive with tls_ca_path (private-CA mode,
+	// identity = gateway_id): setting both is a configuration error.
+	TLSSystemCA  bool `yaml:"tls_system_ca"`
+	AutoRegister bool `yaml:"auto_register"`
 	// TokenPath persists the issued token (0600) so restarts stay authenticated;
 	// mount a small volume there in Docker. Default /data/gateway-token.json.
 	TokenPath string `yaml:"token_path"`
@@ -149,6 +156,11 @@ func Load(path string) (*Config, error) {
 	}
 
 	applyDefaults(&cfg)
+	if cfg.Gateway.TLSSystemCA && cfg.Gateway.TLSCAPath != "" {
+		return nil, fmt.Errorf("gateway.tls_system_ca and gateway.tls_ca_path are mutually exclusive: " +
+			"system trust validates the URL hostname via public CAs, tls_ca_path pins the private " +
+			"registration CA (identity = gateway_id) — configure exactly one")
+	}
 	return &cfg, nil
 }
 

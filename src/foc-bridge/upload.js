@@ -22,9 +22,9 @@ import { Synapse } from '@filoz/synapse-sdk';
 import { calibration, mainnet } from '@filoz/synapse-core/chains';
 import { http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { statSync, createReadStream, readdirSync, readFileSync, writeFileSync } from 'fs';
+import { statSync, createReadStream, readdirSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { execSync } from 'child_process';
-import { resolve, basename, join } from 'path';
+import { resolve, basename, join, dirname } from 'path';
 import { tmpdir } from 'os';
 
 const PRIVATE_KEY = process.env.FOC_PRIVATE_KEY;
@@ -46,7 +46,11 @@ const MAX_PART_SIZE = 900 * 1024 * 1024; // 900 MB per part
 const PART_UPLOAD_ATTEMPTS = Number(process.env.FOC_PART_ATTEMPTS || 4);
 // Where the weights volume is mounted; the CID registry is written here so it
 // survives log rotation and container restarts.
-const MODELS_DIR = process.env.MODEL_CACHE_DIR || '/models';
+const MODELS_DIR = process.env.MODELS_DIR ||
+  (existsSync('/models') ? '/models' : dirname(resolve(process.argv[process.argv.indexOf('--model-dir')+1] || '.')));
+// '/models' is the container mount; a host-side run falls back to the model's
+// parent directory (a registry write to a nonexistent path once crashed AFTER
+// a 12-hour upload — the CIDs survived only because the log was complete).
 
 if (!PRIVATE_KEY) {
   console.error('ERROR: FOC_PRIVATE_KEY is required. Set it in .env');
@@ -106,7 +110,11 @@ async function main() {
   // Pack model directory as tar.gz
   const tarPath = join(tmpdir(), `foc-upload-${basename(modelDir)}.tar.gz`);
   console.log(`\nPacking model to ${tarPath}...`);
-  execSync(`tar -czf "${tarPath}" -C "${modelDir}" .`, { stdio: 'inherit' });
+  // Exclude the downloader's own metadata: .cache/huggingface holds the HF
+  // download index (not weights — the engine never reads it), and its files are
+  // often root-owned 600 from a container download, which aborts the whole pack
+  // with "Cannot open: Permission denied".
+  execSync(`tar --exclude=./.cache -czf "${tarPath}" -C "${modelDir}" .`, { stdio: 'inherit' });
 
   const tarStat = statSync(tarPath);
   const sizeMB = (tarStat.size / (1024 * 1024)).toFixed(1);
@@ -216,8 +224,15 @@ async function main() {
     totalBytes: results.reduce((a, r) => a + r.sizeBytes, 0),
     uploadedAt: new Date().toISOString(),
   };
-  writeFileSync(registryPath, JSON.stringify(registry, null, 2) + '\n');
-  console.log(`Registry updated: ${registryPath}`);
+  try {
+    writeFileSync(registryPath, JSON.stringify(registry, null, 2) + '\n');
+    console.log(`Registry updated: ${registryPath}`);
+  } catch (e) {
+    // NEVER let the CIDs die with a bad path: dump the entry to stdout so the
+    // log itself carries a machine-readable copy.
+    console.error(`Registry write FAILED (${e.message}) — entry follows for manual recovery:`);
+    console.log('RECOVERY-REGISTRY-ENTRY ' + JSON.stringify({ [name]: registry[name] }));
+  }
   console.log(`========================================`);
 
   // Cleanup

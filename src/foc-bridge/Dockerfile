@@ -4,8 +4,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY package.json ./
-RUN npm install --production
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 COPY server.js upload.js ./
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

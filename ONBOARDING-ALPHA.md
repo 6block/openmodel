@@ -5,12 +5,12 @@ gateway-side parameters are prefilled in config/sidecar-mainnet-alpha.yaml;
 only SP-specific fields need filling.
 
 Hands-on time is about 20 minutes, plus the boot model's automatic download
-(6.1 GB; 10-60 minutes depending on bandwidth). No weights need to be prepared
+(6.1 GB transferred — the FOC archive; ~8 GB on disk unpacked; 10-60 minutes
+depending on bandwidth). No weights need to be prepared
 in advance.
 
 Conventions: the repository directory is the runtime directory. Whether you
-git-clone (yields openmodel), download a GitHub ZIP (yields openmodel-main),
-or extract the internal onboarding bundle (yields openmodel-m1-update-v1.3),
+git-clone (yields openmodel) or download a GitHub ZIP (yields openmodel-main),
 everything happens inside that one directory. Examples below use ~/openmodel;
 if your directory name or location differs, substitute the actual path.
 
@@ -66,7 +66,7 @@ later.
 
 ### 1.3 Admission floor
 
-- Raw power ≥ 1 TiB
+- Raw power ≥ 300 GiB
 - Miner balance ≥ 1 FIL
 
 ---
@@ -78,7 +78,6 @@ later.
 | Material | Location (inside the repository directory) |
 |---|---|
 | Image tarballs | three .tar.gz files under release/ |
-| Gateway CA certificate | gateway-ca.crt |
 | Config template | config/sidecar-mainnet-alpha.yaml |
 
 Enter the repository directory (all steps run from here):
@@ -87,26 +86,26 @@ Enter the repository directory (all steps run from here):
 cd ~/openmodel
 ```
 
-Verify the CA fingerprint:
+The gateway lives at **https://openmodel.filfox.info** behind a
+publicly-trusted certificate — the worker validates it through the system
+trust store (`tls_system_ca: true`, preset in the template).
 
-```bash
-openssl x509 -in gateway-ca.crt -noout -fingerprint -sha256 -subject
-```
-
-Expected output:
-
-```
-sha256 Fingerprint=49:1A:4F:DF:F7:6C:A2:56:7C:D3:15:0F:71:CE:C6:B9:C3:18:63:75:09:9E:B4:8C:1A:5E:2C:51:C7:4A:1F:73
-subject=CN = OpenModel Mainnet CA
-```
 
 ### Step 2: load the images
 
 ```bash
-docker load -i release/openmodel-scheduler.tar.gz
-docker load -i release/openmodel-inference.tar.gz
-docker load -i release/openmodel-foc-bridge.tar.gz
+# Downloaded from GitHub Releases (put the files in release/ first).
+# Verify, then load — the inference image ships as split volumes:
+cd release
+sha256sum -c SHA256SUMS.txt
+docker load -i openmodel-scheduler.tar.gz
+docker load -i openmodel-foc-bridge.tar.gz
+cat openmodel-inference.tar.gz.part-* | docker load
+cd ..
 ```
+
+Cloned/ZIP checkouts have an empty release/ directory — the tarballs live on
+GitHub Releases, not in git.
 
 ### Step 3: data/models directories and .env
 
@@ -115,7 +114,10 @@ directories, the CA copy, and .env need to be created:
 
 ```bash
 mkdir -p ~/openmodel/models ~/openmodel/data
-cp ~/openmodel/gateway-ca.crt ~/openmodel/data/gateway-ca.crt
+# The compose file bind-mounts /tmp/curio.log. If the file does not exist,
+# Docker creates a DIRECTORY at that path and the WinningPoSt log watcher is
+# silently useless (DB polling remains as fallback). Make sure it is a file:
+touch /tmp/curio.log
 cp ~/openmodel/.env.example ~/openmodel/.env
 ```
 
@@ -151,8 +153,7 @@ Change two entries, leave the rest at defaults:
   which then fails with: failed to load config: no such file or directory)
 - LOTUS_API_TOKEN=<the token from above>
 
-The CA goes into the data directory (config: tls_ca_path /data/gateway-ca.crt),
-not config.
+The gateway's public certificate is validated through the system trust store.
 
 ### Step 4: model weights (fetched automatically)
 
@@ -161,7 +162,7 @@ the catalog's piece registry):
 
 - The **boot model** (inference.model) downloads at **first start** — the API
   is not up yet and the worker is invisible to the gateway meanwhile. The
-  default 4B is ~6.1 GB; download time varies widely with bandwidth (measured
+  default 4B transfers ~6.1 GB (about 8 GB on disk); download time varies widely with bandwidth (measured
   10-60 minutes), plus ~1 minute to extract and ~30 s to load.
 - The **other claimed entries** prefetch in the background after start-up;
   admission probing for them simply defers until ready (timeouts are not
@@ -178,6 +179,7 @@ the catalog's piece registry):
 | Qwen--Qwen3-8B | Qwen/Qwen3-8B | fp16 | ~16 GB | 1x24G, or 4x10G |
 | openai--gpt-oss-20b | openai/gpt-oss-20b | mxfp4 | ~13 GB | 1x24G, or 2-4x10G |
 | Qwen--Qwen3-32B-AWQ | Qwen/Qwen3-32B-AWQ | awq-int4 | ~19 GB | 1x24G (tight), 4-8x10G |
+| Qwen--Qwen3.8-27B-FP8 | Qwen/Qwen3.8-27B-FP8 | fp8 (Marlin W8A16 on Ampere) | ~28 GB | 8x10G (tp=8) |
 
 Quantisation is part of the catalog entry; a same-name different-quant
 deployment cannot pass verification. Disk budget: every claimed entry is
@@ -196,7 +198,7 @@ Fill the fields marked <<<:
 | lotus.miner_address | miner id, e.g. f01234 |
 | inference.model | the catalog entry this machine serves |
 | inference.multi_gpu.gpu_count / device_ids | per actual GPUs |
-| gateway.worker_id | 1-64 chars, alphanumeric/-/_, e.g. sp-alpha-01 |
+| gateway.worker_id | 1-64 chars, starts alphanumeric, then letters/digits/`.`/`-`/`_`; e.g. sp-alpha-01 |
 | gateway.payout_address | EVM address earnings settle to (0x...) |
 | gateway.public_endpoint | https://<public-ip>:<mapped-inference-port> |
 | gateway.public_scheduler_url | https://<public-ip>:<mapped-scheduler-port> |
@@ -225,16 +227,20 @@ Worked example, 8x RTX 3080 (10 GB each), measured on our own machine:
 | Model | Fits one 10 GB card? | Mode | Notes |
 |---|---|---|---|
 | Qwen3-32B-AWQ | no (~19 GB) | tensor_parallel, device_ids 0-7 | needs enforce_eager true; max_model_len 8192 |
+| Qwen3.8-27B-FP8 | no (~28 GB) | tensor_parallel, device_ids 0-7 | FP8 via Marlin W8A16 on Ampere; enforce_eager true; max_model_len 8192 |
 | gpt-oss-20b (mxfp4) | no | tensor_parallel, device_ids 0-7 | 1.81 GiB weights + 6.34 GiB KV per card |
 | Qwen3-4B (fp16) | barely (7.6 GB) | either | one engine per card needs max_model_len 4096, KV only ~1 GiB |
-| Qwen2.5-3B / 1.5B | yes | multi_instance | 8 engines, ~8x the throughput |
+| Qwen3-8B (fp16) | no (~16 GB) | tensor_parallel, 4+ cards | max_model_len 8192 |
 
 So for a 32B model on 10 GB cards the answer is tensor_parallel — not a
 preference: the weights do not fit any other way.
 
-Whichever mode, list every model this machine can serve under
-gateway.supported_models — the gateway switches between them on demand, and a
-model absent from that list is never routed here.
+Whichever mode: gateway.supported_models ships with the FULL production
+catalog claimed by default — TRIM it to what this machine can actually serve
+(the gateway switches between claimed models on demand; a model absent from
+the list is never routed here). Claiming a model your engine shape cannot load
+is safe but useless: the switch fails with a clean error and the weights still
+cost you disk.
 
 ### Step 6: verify registration on its own
 
@@ -313,8 +319,8 @@ The config is missing mode: prod (the default is dev, which uses a mock Lotus
 and is rejected). The template includes the line — do not delete it.
 
 **https gateway_url configured but no CA available ... TLS dials will fail closed**
-~/openmodel/data/gateway-ca.crt is missing or mispathed. Without a CA, TLS
-fails outright — it never downgrades to plaintext.
+`tls_system_ca: true` is missing from the gateway section — the template
+presets it; do not delete it. TLS never downgrades to plaintext.
 
 **could not query the local Lotus wallet (lotus.api_token missing or lacking permission?)**
 .env not created, LOTUS_API_TOKEN unset, token lacks permission (sign or
@@ -384,11 +390,17 @@ container logs.
 
 | Item | Value |
 |---|---|
-| Gateway | https://36.189.235.195:18020 |
+| Gateway | https://openmodel.filfox.info |
 | gateway_id | openmodel-mainnet |
 | Settlement contract (Filecoin mainnet) | 0x60D41baEaBe1ABE061AE82c44425debc35bA524A |
 | Settlement tokens | FIL, USDFC |
-| Admission floor | power ≥ 1 TiB, miner balance ≥ 1 FIL |
+| Admission floor | power ≥ 300 GiB, miner balance ≥ 1 FIL |
 | CA fingerprint (SHA256) | 49:1A:4F:DF:F7:6C:A2:56:7C:D3:15:0F:71:CE:C6:B9:C3:18:63:75:09:9E:B4:8C:1A:5E:2C:51:C7:4A:1F:73 |
 | Worker cert validity | 7 days, auto-renewed at half-life |
 | Registration rate limit | 6/minute |
+
+---
+
+Once you are serving: **[SP-GUIDE.md](SP-GUIDE.md)** covers day-2 operations —
+checking your status, watching and withdrawing earnings, the platform's
+verification rules, and troubleshooting.

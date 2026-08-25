@@ -51,7 +51,11 @@ type Config struct {
 	// TLSCAPath is the trust anchor for an https GatewayURL (cold start; once
 	// registered, the cert store's CA is trusted as well).
 	TLSCAPath string
-	TokenPath string // where the issued token persists (0600); empty = not persisted
+	// TLSSystemCA: trust the system certificate store and validate the URL's
+	// hostname instead of the registration CA + gateway_id — for gateways on a
+	// public domain with a publicly-trusted certificate. See config.TLSSystemCA.
+	TLSSystemCA bool
+	TokenPath   string // where the issued token persists (0600); empty = not persisted
 	// AutoRegister mirrors gateway.auto_register: whether registration runs on
 	// start-up. A Registrar is built whenever a gateway URL is configured even if
 	// this is false — the worker may still hold a valid token from an earlier
@@ -136,6 +140,19 @@ func (r *Registrar) rebuildTransport() {
 	if !strings.HasPrefix(r.cfg.GatewayURL, "https://") {
 		return
 	}
+	if r.cfg.TLSSystemCA {
+		// Public-trust mode: the system store validates the chain and Go's
+		// default hostname verification checks the dialed host — the gateway
+		// sits behind a real domain with a publicly-trusted certificate, so
+		// there is no CA file to place and gateway_id plays no TLS role here
+		// (it remains the signature domain of the registration protocol).
+		r.hc.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+		}
+		r.logger.Info("worker→gateway TLS armed", "trust", "system CA store",
+			"identity", "URL hostname")
+		return
+	}
 	pool := x509.NewCertPool()
 	added := false
 	if r.cfg.TLSCAPath != "" {
@@ -161,7 +178,8 @@ func (r *Registrar) rebuildTransport() {
 			MinVersion: tls.VersionTLS12,
 		},
 	}
-	r.logger.Info("worker→gateway TLS armed", "server_name", r.cfg.GatewayID)
+	r.logger.Info("worker→gateway TLS armed", "trust", "registration CA",
+		"server_name", r.cfg.GatewayID)
 }
 
 // NoteGatewayPoll records that the gateway just authenticated a /ready poll with the

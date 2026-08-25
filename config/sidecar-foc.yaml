@@ -41,8 +41,8 @@ grpc:
 # AI Inference engine — real vLLM, single GPU 0
 inference:
   engine: "vllm"
-  model: "Qwen/Qwen2.5-1.5B-Instruct"
-  gpu_memory_utilization: 0.80
+  model: "Qwen/Qwen3-4B-Instruct-2507"   # production-catalog entry (qwen3-4b) — its piece CIDs are in the registry below
+  gpu_memory_utilization: 0.93
   max_model_len: 4096
   api_port: 8000
 
@@ -61,7 +61,7 @@ foc:
   real:
     bridge_url: "http://127.0.0.1:3100"
     piece_cid_registry:
-      "Qwen/Qwen3-4B-Instruct-2507":   # 6.1GB, 7 parts, dual-SP (providers 4 & 9), uploaded 2026-08-03
+      "Qwen/Qwen3-4B-Instruct-2507":   # 6.1GB, 7 parts, multi-provider replication
         - "bafkzcibfqcaiaoqzovl27pzr2b4vuioigr42ulv7xfs2p4jiban5wfyp7mg7lacdryqq"
         - "bafkzcibfqcaiaoqzqdlg352mlrtytqjhr2dmmwnbv3aojkhrwmzjq5ysli7wticfhina"
         - "bafkzcibfqcaiaoqza5qqjwbwdplg2566t5qzbarkqjobgh5tenn44o6qvy5nnuyica5a"
@@ -98,6 +98,8 @@ logging:
 #   auto_register: true                           # false = only manual trigger via -register-only
 #   # worker_id: sp-<your-miner-id>               # optional; defaults to "sp-" + miner address
 #   # gpu_count: 8                                # optional; corrected from live engine count after the first poll
+#   # (commented samples below predate the 27B entry — see
+#   #  sidecar-mainnet-alpha.yaml for the current 5-model catalog)
 #   supported_models:              # production catalog v1 — claim what you can serve;
 #     - "/models/Qwen--Qwen3-4B-Instruct-2507"   # qwen3-4b   fp16  ~8G   (1x24G, or TP=2 on 10G cards)
 #     - "/models/Qwen--Qwen3-8B"                 # qwen3-8b   fp16  ~16G  (1x24G, or TP=4 on 10G cards)

@@ -107,6 +107,7 @@ func main() {
 				GPUCount:           cfg.Gateway.GPUCount,
 				SupportedModels:    cfg.Gateway.SupportedModels,
 				TLSCAPath:          cfg.Gateway.TLSCAPath,
+				TLSSystemCA:        cfg.Gateway.TLSSystemCA,
 				TokenPath:          cfg.Gateway.TokenPath,
 				AutoRegister:       cfg.Gateway.AutoRegister,
 			}, rpcClient, logger)
@@ -183,6 +184,13 @@ func main() {
 				sched.SetProofMonitor(dbClient, minerID, proofWaitCfg)
 				defer dbClient.Close()
 			}
+		} else {
+			// Loud, not silent: an empty DSN usually means the config used keys
+			// the struct does not have (db_host/db_port…) — YAML drops unknown
+			// keys without complaint, and this exact combination kept WinningPoSt
+			// detection off on a production worker for two weeks unnoticed.
+			logger.Warn("curio.dsn is empty — proof detection AND WinningPoSt monitoring are DISABLED; " +
+				"if you meant to configure Curio, use a single dsn string (split db_host/db_port keys are not read)")
 		}
 	}
 

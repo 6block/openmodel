@@ -6,7 +6,7 @@ RUN go mod download
 
 COPY . .
 # Build from the COMMITTED protobuf stubs (proto/sidecar/*.pb.go, kept in sync
-# via scripts/gen-proto.sh). We intentionally do NOT regenerate them in-build:
+# via protoc; see proto/sidecar.proto). We intentionally do NOT regenerate them in-build:
 # the previous `protoc-gen-go-grpc@latest` is unpinned and drifted to v1.6.2,
 # which requires Go >= 1.25 and breaks this Go-1.24 build. Committed stubs are
 # the source of truth (and are exercised by `go test`), so the build is now

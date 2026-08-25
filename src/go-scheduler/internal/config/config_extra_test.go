@@ -59,3 +59,32 @@ func TestLoadInterpolatesAndAppliesDefaults(t *testing.T) {
 		t.Errorf("default PollIntervalSec = %d, want 15", cfg.Lotus.PollIntervalSec)
 	}
 }
+
+// tls_system_ca and tls_ca_path select two different trust models (public CAs
+// + URL hostname vs the private registration CA + gateway_id). Both at once is
+// ambiguous intent — Load must refuse rather than silently pick one.
+func TestLoad_TLSSystemCAExclusiveWithCAPath(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "cfg.yaml")
+	body := "mode: prod\ngateway:\n  url: https://gateway.example.com\n  tls_system_ca: true\n  tls_ca_path: /data/gateway-ca.crt\n"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil {
+		t.Fatal("Load accepted tls_system_ca together with tls_ca_path")
+	}
+}
+
+func TestLoad_TLSSystemCAAloneOK(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "cfg.yaml")
+	body := "mode: prod\ngateway:\n  url: https://gateway.example.com\n  tls_system_ca: true\n"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("system-CA-only config rejected: %v", err)
+	}
+	if !cfg.Gateway.TLSSystemCA {
+		t.Fatal("tls_system_ca not parsed")
+	}
+}

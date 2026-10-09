@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .engine import EngineState, GenerateResult, InferenceEngine
+from .multimodal import parse_content
 from .receipt import build_receipt, get_signer
 
 logger = logging.getLogger(__name__)
@@ -23,10 +24,29 @@ logger = logging.getLogger(__name__)
 _tokenizers: dict = {}
 
 
+def _content_text(content) -> str:
+    """Best-effort text extraction from a message `content` (str | list). Used
+    only for affinity-key hashing and the no-template bare join — never for
+    the template itself."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            p.get("text", "") for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return ""
+
+
 def _chat_prompt(engine, messages, enable_thinking: bool = False):
     """Render the conversation with the model's own chat template.
 
-    The bare "role: content" join below it is kept only for models that ship no
+    Returns (prompt, images): `prompt` is the rendered text (image parts become
+    template markers); `images` is the ordered list of decoded PIL images to hand
+    vLLM out-of-band (empty for text-only). Pixels never enter the token path —
+    receipts keep hashing the rendered text + response exactly as before.
+
+    The bare "role: content" join below is kept only for models that ship no
     template. Feeding that bare transcript to an instruction-tuned model makes
     it treat the input as text to continue — it completes the user's sentence
     and invents its own turn markers. Qwen2.5 masked this by answering anyway;
@@ -43,9 +63,18 @@ def _chat_prompt(engine, messages, enable_thinking: bool = False):
             logger.warning("no tokenizer loadable for %s; falling back to bare prompt", path)
             tok = False  # negative-cache: do not retry on every request
         _tokenizers[path] = tok
+
+    rendered = []
+    images = []
+    for m in messages:
+        parsed = parse_content(m.content)
+        if parsed.has_image:
+            images.extend(parsed.images)
+        rendered.append({"role": m.role, "content": parsed.rendered})
+
     if tok and getattr(tok, "chat_template", None):
-        return tok.apply_chat_template(
-            [{"role": m.role, "content": m.content} for m in messages],
+        prompt = tok.apply_chat_template(
+            rendered,
             tokenize=False,
             add_generation_prompt=True,
             # Default OFF: reasoning models emit a <think> block that multiplies
@@ -54,7 +83,8 @@ def _chat_prompt(engine, messages, enable_thinking: bool = False):
             # ignore it either way.
             enable_thinking=enable_thinking,
         )
-    return "\n".join(f"{m.role}: {m.content}" for m in messages)
+        return prompt, images
+    return "\n".join(f"{m.role}: {_content_text(m.content)}" for m in messages), images
 
 
 class _ThinkSplitter:
@@ -186,7 +216,7 @@ def _engine_session_key(http_request, messages=None, prompt=None):
     parts = []
     if messages:
         for m in messages[:2]:
-            content = m.content if isinstance(m.content, str) else ""
+            content = _content_text(m.content)
             parts.append(f"{m.role}:{content}")
     elif isinstance(prompt, str) and prompt:
         parts.append("p:" + prompt)
@@ -205,9 +235,20 @@ def _is_context_length_error(e: Exception) -> bool:
             or ("prompt" in msg and "too long" in msg))
 
 
+def _is_multimodal_limit_error(e: Exception) -> bool:
+    """True if vLLM rejected the request for carrying more images than the engine's
+    per-prompt cap ("At most N image(s) may be provided in one prompt"). The API layer
+    enforces the cap itself before generate(); this catches any path that slipped by so
+    the client still gets a 400, not a 500."""
+    msg = str(e).lower()
+    return "may be provided in one prompt" in msg or ("at most" in msg and "image" in msg)
+
+
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    # Text (str) for text-only, or an OpenAI-style multimodal array of parts
+    # ({"type": "text"|"image_url", ...}) for VLM requests.
+    content: str | list
     # Present on assistant RESPONSES when thinking was requested; ignored (and
     # never re-rendered into the prompt) when a client echoes it back in history.
     reasoning_content: str | None = None
@@ -395,7 +436,10 @@ def create_app(engine: InferenceEngine, model_manager=None,
             # resumes interrupted streams onto workers that advertise it, so mixed old/
             # new worker fleets degrade gracefully instead of double-generating.
             # "receipt" = signs per-request inference receipts (A1); pubkey below.
-            "features": ["continuation", "receipt"],
+            # "vision" = the LOADED model accepts image parts in chat messages
+            # (OpenAI multimodal content arrays); absent for text-only models.
+            "features": ["continuation", "receipt"]
+                        + (["vision"] if getattr(engine, "is_vlm", False) else []),
             "receipt_pubkey": get_signer().pubkey_hex,
         }
 
@@ -452,7 +496,26 @@ def create_app(engine: InferenceEngine, model_manager=None,
 
         want_thinking = bool(request.enable_thinking or
                              (request.chat_template_kwargs or {}).get("enable_thinking"))
-        prompt = _chat_prompt(engine, request.messages, enable_thinking=want_thinking)
+        try:
+            prompt, images = _chat_prompt(engine, request.messages, enable_thinking=want_thinking)
+        except ValueError as e:
+            # A malformed / oversized / undecodable image part is the client's mistake:
+            # fail clean with 400 before the engine is touched (not an unhandled 500).
+            raise HTTPException(status_code=400, detail=f"invalid message content: {e}")
+        if images and not getattr(engine, "is_vlm", True):
+            # The loaded model has no vision encoder: vLLM would reject the
+            # multi_modal_data deep inside generate() as a 500. Say so plainly —
+            # the client asked a text model to look at a picture.
+            raise HTTPException(
+                status_code=400,
+                detail=f"model {engine.current_model!r} does not accept image input")
+        cap = getattr(engine, "max_images_per_prompt", 0) or 0
+        if cap and len(images) > cap:
+            # Same reason: vLLM enforces limit_mm_per_prompt inside generate() with a
+            # bare ValueError (observed live as an unhandled 500). Refuse at the edge.
+            raise HTTPException(
+                status_code=400,
+                detail=f"too many images: {len(images)} provided, this model accepts at most {cap} per request")
         # Template dialects differ: older Qwen3 models GENERATE "<think>…</think>"
         # themselves, newer templates pre-fill the opening tag in the prompt and
         # the generation starts inside the reasoning. Detect which one we got.
@@ -483,6 +546,10 @@ def create_app(engine: InferenceEngine, model_manager=None,
             top_p=request.top_p,
             stop=request.stop,
         )
+        # VLM: hand decoded images to the engine out-of-band (never into the token
+        # prompt). Empty list is a no-op for text-only engines.
+        if images:
+            gen_kwargs["images"] = images
         session_key = _engine_session_key(http_request, messages=request.messages)
 
         # --- Streaming response ---
@@ -605,6 +672,8 @@ def create_app(engine: InferenceEngine, model_manager=None,
             # Prompt exceeds the model's context window → client error, clean 400.
             if _is_context_length_error(e):
                 raise HTTPException(status_code=400, detail=f"context length exceeded: {e}")
+            if _is_multimodal_limit_error(e):
+                raise HTTPException(status_code=400, detail=f"too many images: {e}")
             raise
 
         if isinstance(result, GenerateResult):
@@ -694,6 +763,8 @@ def create_app(engine: InferenceEngine, model_manager=None,
         except ValueError as e:
             if _is_context_length_error(e):
                 raise HTTPException(status_code=400, detail=f"context length exceeded: {e}")
+            if _is_multimodal_limit_error(e):
+                raise HTTPException(status_code=400, detail=f"too many images: {e}")
             raise
 
         if isinstance(result, GenerateResult):

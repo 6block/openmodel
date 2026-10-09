@@ -74,6 +74,32 @@ def test_registry_dict_entry_carries_sha256():
     assert c._sha256["m"] == ("ab" * 32)  # lowercased
 
 
+def test_registry_accepts_uploader_parts_shape():
+    """The uploader's own foc-registry.json names the ordered CID list "parts".
+    That entry must be usable as-is: making an operator retype a 15-element CID
+    array under a second key is exactly the copy step that corrupts the values
+    the integrity gate checks against."""
+    c = RealFOCClient("http://bridge/", {
+        "Org/Model": {"parts": ["p1", "p2", "p3"], "sha256": "AB" * 32},
+    })
+    assert c._get_cids("Org/Model") == ["p1", "p2", "p3"]
+    assert c._sha256["Org/Model"] == ("ab" * 32)
+    # Path-form claim resolves to the same entry, digest included.
+    manifest = asyncio.run(c.resolve_model("/models/Org--Model"))
+    assert manifest.source_uri == "p1,p2,p3"
+    assert manifest.checksum_sha256 == ("ab" * 32)
+
+
+def test_registry_cids_wins_over_parts_when_both_present():
+    """If an operator writes both, "cids" is the documented config spelling and
+    takes precedence — otherwise a stale "parts" from a copied registry entry
+    would silently shadow the edited list."""
+    c = RealFOCClient("http://bridge/", {
+        "m": {"cids": ["new1"], "parts": ["old1", "old2"]},
+    })
+    assert c._get_cids("m") == ["new1"]
+
+
 def test_resolve_model_carries_pinned_digest():
     c = make({"m": {"cids": ["c1"], "sha256": "cd" * 32}})
     manifest = asyncio.run(c.resolve_model("m"))

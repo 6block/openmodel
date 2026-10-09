@@ -120,6 +120,14 @@ async function main() {
   const sizeMB = (tarStat.size / (1024 * 1024)).toFixed(1);
   console.log(`Archive size: ${sizeMB} MB`);
 
+  // Digest of the WHOLE archive, computed before it is split and deleted. This is
+  // the value a downloader pins (piece_cid_registry {cids, sha256}) so the bridge
+  // can refuse a tampered or mis-assembled download. Streamed: the archive may be
+  // tens of GB.
+  console.log(`Hashing archive (sha256)...`);
+  const tarSha256 = execSync(`sha256sum "${tarPath}"`).toString().split(/\s+/)[0];
+  console.log(`Archive sha256: ${tarSha256}`);
+
   // Split into parts if needed
   const splitDir = join(tmpdir(), `foc-split-${Date.now()}`);
   execSync(`mkdir -p "${splitDir}"`);
@@ -222,8 +230,10 @@ async function main() {
     parts: results.map((r) => r.pieceCid),
     partSizes: results.map((r) => r.sizeBytes),
     totalBytes: results.reduce((a, r) => a + r.sizeBytes, 0),
+    sha256: tarSha256,
     uploadedAt: new Date().toISOString(),
   };
+  console.log(`Archive sha256 (pin this in piece_cid_registry): ${tarSha256}`);
   try {
     writeFileSync(registryPath, JSON.stringify(registry, null, 2) + '\n');
     console.log(`Registry updated: ${registryPath}`);

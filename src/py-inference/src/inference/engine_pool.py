@@ -177,6 +177,16 @@ class EnginePool(InferenceEngine):
             return self._engines[0].current_model
         return ""
 
+    @property
+    def is_vlm(self) -> bool:
+        """True if the loaded model accepts image parts (all engines load the same model)."""
+        return bool(self._engines) and bool(getattr(self._engines[0], "is_vlm", False))
+
+    @property
+    def max_images_per_prompt(self) -> int:
+        """Per-request image cap of the underlying engines (identical across the pool)."""
+        return int(getattr(self._engines[0], "max_images_per_prompt", 0)) if self._engines else 0
+
     def is_available(self) -> bool:
         if self._mode == "tensor_parallel":
             return self._engines[0].is_available()
@@ -336,6 +346,7 @@ def create_engine_pool(cfg) -> EnginePool:
             device_ids=device_ids,
             gpu_id=0,  # mock: show as GPU 0
             enforce_eager=cfg.inference.enforce_eager,
+            max_images_per_prompt=cfg.inference.max_images_per_prompt,
         )
         return EnginePool(mode="tensor_parallel", engines=[engine])
 
@@ -351,6 +362,7 @@ def create_engine_pool(cfg) -> EnginePool:
                 device_ids=[dev_id],
                 gpu_id=dev_id,  # mock: show GPU ID
                 enforce_eager=cfg.inference.enforce_eager,
+                max_images_per_prompt=cfg.inference.max_images_per_prompt,
             )
             engines.append(engine)
         return EnginePool(

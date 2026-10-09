@@ -57,6 +57,31 @@ class StreamChunk:
     cached_tokens: int = 0       # Set only on the last chunk (prefix-cache hits)
 
 
+def _config_is_vlm(model_config) -> bool:
+    """True if a HF model config describes an image-understanding model: it carries
+    a vision sub-config, or its architecture name is a *ForConditionalGeneration
+    multimodal class. Text-only models (Qwen3ForCausalLM etc.) return False."""
+    if getattr(model_config, "vision_config", None) is not None:
+        return True
+    archs = getattr(model_config, "architectures", None) or []
+    return any("VL" in a or "Vision" in a for a in archs)
+
+
+def _vllm_prompt(prompt: str, images):
+    """Build the first positional argument for `AsyncLLMEngine.generate(...)`.
+
+    Text-only requests pass the bare string (unchanged behaviour). A VLM request
+    wraps it in vLLM's TextPrompt dict with the decoded PIL images under
+    `multi_modal_data["image"]` — vLLM 0.22's generate() has NO separate
+    multimodal keyword; the images must ride inside the prompt object. The
+    chat template has already emitted the model's image placeholder tokens
+    into `prompt`, so text and pixels line up 1:1 in order.
+    """
+    if not images:
+        return prompt
+    return {"prompt": prompt, "multi_modal_data": {"image": list(images)}}
+
+
 def _extract_cached_tokens(request_output, prompt_tokens: int) -> int:
     """Prompt tokens served from vLLM's automatic prefix cache for this request.
 
@@ -140,7 +165,8 @@ class VLLMEngine(InferenceEngine):
                  max_model_len: int = 4096,
                  tensor_parallel_size: int = 1,
                  device_ids: list[int] | None = None,
-                 enforce_eager: bool = False):
+                 enforce_eager: bool = False,
+                 max_images_per_prompt: int = 1):
         self._state = EngineState.STOPPED
         self._engine = None
         self._model = ""
@@ -149,6 +175,10 @@ class VLLMEngine(InferenceEngine):
         self._tensor_parallel_size = tensor_parallel_size
         self._device_ids = device_ids
         self._enforce_eager = enforce_eager
+        # Image-understanding models: per-request image cap passed to vLLM as
+        # limit_mm_per_prompt. Only applied when the loaded model is a VLM.
+        self._max_images_per_prompt = max(1, int(max_images_per_prompt))
+        self._is_vlm = False  # set on (re)load from the model config
         self._active_requests = 0
         self._inflight_request_ids: set[str] = set()
 
@@ -223,6 +253,7 @@ class VLLMEngine(InferenceEngine):
         # Auto-adapt max_model_len: if model's max_position_embeddings is smaller
         # than configured max_model_len, use the model's limit instead.
         effective_max_model_len = self._max_model_len
+        is_vlm = False
         try:
             from transformers import AutoConfig
             model_config = AutoConfig.from_pretrained(self._model, trust_remote_code=True)
@@ -231,8 +262,19 @@ class VLLMEngine(InferenceEngine):
                 logger.info("adapting max_model_len: %d -> %d (model limit)",
                             effective_max_model_len, model_max)
                 effective_max_model_len = model_max
+            is_vlm = _config_is_vlm(model_config)
         except Exception as e:
             logger.debug("could not read model config for max_model_len: %s", e)
+
+        extra = {}
+        if is_vlm:
+            # Image-understanding model: cap the number of images per request so the
+            # vision encoder's activation budget is bounded on 10 GB cards, and so a
+            # client cannot submit an unbounded batch of images in one message.
+            extra["limit_mm_per_prompt"] = {"image": self._max_images_per_prompt}
+            logger.info("vision-language model detected — accepting up to %d image(s) per request",
+                        self._max_images_per_prompt)
+        self._is_vlm = is_vlm
 
         args = AsyncEngineArgs(
             model=self._model,
@@ -242,6 +284,7 @@ class VLLMEngine(InferenceEngine):
             trust_remote_code=True,
             enforce_eager=self._enforce_eager,
             enable_prefix_caching=True,  # report num_cached_tokens for cache-read billing (V1 default; set explicitly to be deterministic)
+            **extra,
         )
         self._engine = AsyncLLMEngine.from_engine_args(args)
 
@@ -644,6 +687,16 @@ class VLLMEngine(InferenceEngine):
     def current_model(self) -> str:
         return self._model
 
+    @property
+    def is_vlm(self) -> bool:
+        """True while the loaded model accepts image parts (set from its config on load)."""
+        return self._is_vlm
+
+    @property
+    def max_images_per_prompt(self) -> int:
+        """Per-request image cap handed to vLLM (limit_mm_per_prompt) for VLMs."""
+        return self._max_images_per_prompt
+
     def is_available(self) -> bool:
         # _accepting goes False while a model switch drains this engine:
         # no NEW requests are routed here, but in-flight ones finish normally.
@@ -742,6 +795,7 @@ class VLLMEngine(InferenceEngine):
         from vllm import SamplingParams
 
         request_id = f"req-{_uuid.uuid4().hex[:12]}"
+        images = kwargs.pop("images", None) or None
 
         sp_kwargs = dict(
             max_tokens=kwargs.get("max_tokens", 256),
@@ -759,7 +813,8 @@ class VLLMEngine(InferenceEngine):
         self._active_requests += 1
         self._inflight_request_ids.add(request_id)
         try:
-            results_generator = self._engine.generate(prompt, sampling_params, request_id)
+            results_generator = self._engine.generate(
+                _vllm_prompt(prompt, images), sampling_params, request_id)
             final_output = None
             async for request_output in self._iter_outputs(results_generator, request_id):
                 # Check if we got paused mid-generation
@@ -823,6 +878,7 @@ class VLLMEngine(InferenceEngine):
         from vllm import SamplingParams
 
         request_id = f"req-{_uuid.uuid4().hex[:12]}"
+        images = kwargs.pop("images", None) or None
 
         sp_kwargs = dict(
             max_tokens=kwargs.get("max_tokens", 256),
@@ -841,7 +897,8 @@ class VLLMEngine(InferenceEngine):
         self._inflight_request_ids.add(request_id)
         prev_text = ""
         try:
-            results_generator = self._engine.generate(prompt, sampling_params, request_id)
+            results_generator = self._engine.generate(
+                _vllm_prompt(prompt, images), sampling_params, request_id)
             final_output = None
             async for request_output in self._iter_outputs(results_generator, request_id):
                 if self._state != EngineState.RUNNING:
@@ -1028,6 +1085,7 @@ def create_engine(engine_type: str, **kwargs) -> InferenceEngine:
             tensor_parallel_size=kwargs.get("tensor_parallel_size", 1),
             device_ids=kwargs.get("device_ids"),
             enforce_eager=kwargs.get("enforce_eager", False),
+            max_images_per_prompt=kwargs.get("max_images_per_prompt", 1),
         )
     else:
         raise ValueError(f"Unknown engine type: {engine_type}")

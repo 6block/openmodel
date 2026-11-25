@@ -16,12 +16,12 @@ settlement smart contract and billing verifier live in
 ```
 openmodel/
 ├── README.md               # This document (deployment guide)
-├── ONBOARDING-ALPHA.md     # Join the hosted mainnet alpha as a provider
+├── GETTING-STARTED-SP.md   # Join the hosted mainnet alpha as a provider
 ├── SP-GUIDE.md             # Day-2 operations: status, earnings, withdrawal, rules
 ├── UPDATE-NOTES.md         # Release update notes (read before upgrading)
 ├── docker-compose.yml      # Compose file (pre-built images)
 ├── .env.example            # Environment variable template
-├── config/                 # Scenario configs (single GPU / 8-GPU / FOC / mainnet alpha)
+├── config/                 # Scenario configs (single GPU / 8-GPU / FOC / mainnet alpha / multi-pool)
 ├── src/                    # Source code (go-scheduler, py-inference, foc-bridge, proto)
 └── release/                # Staging area for image tarballs (uploaded to GitHub Releases)
 ```
@@ -33,7 +33,7 @@ Three containerized services, one `docker compose up -d`:
 | Service | Image | Role | Port |
 |---|---|---|---|
 | Scheduler | `openmodel-scheduler` | Watches the miner's proving deadlines (Lotus RPC) and WinningPoSt elections (Curio); orders the GPUs to yield/resume; self-registers with a gateway and runs the worker's TLS front | 9090 (+39443 TLS) |
-| Inference | `openmodel-inference` | vLLM engine, OpenAI-compatible REST API; one engine per GPU (multi-instance) or one model across GPUs (tensor parallel) | 8000 (+38443 TLS) |
+| Inference | `openmodel-inference` | OpenAI-compatible REST API over four engine kinds — vLLM (text and image understanding), diffusion (image generation), ASR (speech recognition), TTS (speech synthesis); one engine, or several pools each on its own cards (see [Multimodal workers](#multimodal-workers-engines-and-pools)) | 8000 (+38443 TLS) |
 | FOC Bridge | `openmodel-foc-bridge` | Downloads model weights from Filecoin SP retrieval URLs, with streaming sha256 integrity verification | 3100 |
 
 ## Requirements
@@ -62,7 +62,8 @@ cp .env.example .env       # set LOTUS_API_TOKEN, SIDECAR_CONFIG, MODEL_CACHE_DI
 #    sidecar-8gpu-multi.yaml   8 GPUs, one engine per GPU (small models, max throughput)
 #    sidecar-8gpu-tensor.yaml  8 GPUs, tensor parallel (models too big for one card)
 #    sidecar-foc.yaml          single GPU, weights fetched from a Filecoin SP
-#    sidecar-mainnet-alpha.yaml join the hosted mainnet alpha (see ONBOARDING-ALPHA.md)
+#    sidecar-mainnet-alpha.yaml join the hosted mainnet alpha (see GETTING-STARTED-SP.md)
+#    sidecar-multipool-example.yaml text + image generation + speech pools on one worker
 
 # 4. (Optional but recommended) Fill in the gateway block — see next section
 
@@ -79,6 +80,12 @@ curl http://localhost:8000/health        # inference (model load takes 1–3 min
 curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer $INFERENCE_API_TOKEN" -H "Content-Type: application/json" \
   -d '{"model":"default","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
+```
+
+On a multi-pool worker, check that every pool came up on its cards:
+
+```bash
+curl -s http://localhost:8000/health | python3 -c 'import json,sys; h=json.load(sys.stdin); print(h["engine_state"], h["features"]); [print(p["name"], p["engine_state"], p["devices"], p["models"]) for p in h["multi_gpu"]["pools"]]'
 ```
 
 ## Production model catalog
@@ -108,6 +115,82 @@ Rules that keep the catalog honest:
 - On 10 GB-class cards the 32k context is tight (tensor-parallel + eager mode
   required); 24 GB-class cards are comfortable. Smaller `max_model_len`
   configurations are a per-SP choice.
+- **Quantized weights are served under an id that names the quantization**
+  (`…-AWQ`, `…-FP8`, `…-4bit`, …). The worker reads `quantization_config` from
+  the model's `config.json` and refuses to start quantized weights under a
+  full-precision id (`quantized models must be served under their own id`).
+  Models published only in a quantized form (`gpt-oss`, MXFP4) keep their
+  official id.
+
+The table lists the text entries whose Filecoin piece registry ships in
+`config/sidecar-mainnet-alpha.yaml`. The network's catalog also carries
+image-understanding, image-generation and speech models; the live list, each
+entry's `modality` and `price_unit`, and the prices are served by the gateway
+at `GET /v1/catalog` (or `GET /v1/models`) — read them there before choosing
+what to claim.
+
+## Multimodal workers: engines and pools
+
+The inference service runs four engine kinds. Each serves its own endpoint
+and is billed in its own unit:
+
+| `engine` | Serves | Endpoint | Billing unit (quantity) | Weights on disk |
+|---|---|---|---|---|
+| `vllm` | text and image-understanding chat | `/v1/chat/completions` (images as `image_url` content parts) | `token` (prompt + completion; images count as prompt tokens) | `config.json` naming an architecture + weights |
+| `diffusion` | image generation | `/v1/images/generations` | `image` (images delivered) | diffusers layout (`model_index.json` + component directories) |
+| `asr` | speech recognition | `/v1/audio/transcriptions` (multipart) | `audio_second` (input duration, rounded up, minimum 1) | faster-whisper / CTranslate2 (`model.bin` + `vocabulary.txt` or `vocabulary.json`) |
+| `tts` | speech synthesis | `/v1/audio/speech` (WAV, MP3, Opus, AAC, FLAC or PCM) | `character` (input Unicode code points) | Kokoro v1.0 (`kokoro-v1_0.pth` + `voices/`) |
+
+A worker runs either **one engine** (the `inference:` block as in every
+single-engine template) or **several pools** under `inference.pools`. Each
+pool is a complete engine configuration on its own cards — `engine`, `model`,
+`device_ids`, `mode` and its own limits — with a `supported_models` list of
+the models it may switch to. Settings written once in the `inference:` block
+apply to every pool that does not set its own. A ready-to-fill example lives
+in `config/sidecar-multipool-example.yaml`; [SP-GUIDE.md §6](SP-GUIDE.md)
+covers switching rules and operations.
+
+- **Disjoint cards.** Two pools listing the same card stop the worker at
+  start-up (`GPU <n> is assigned to both pool '<a>' and pool '<b>'`). Small
+  speech engines may share a card when **every** pool on it sets
+  `share_devices: true`.
+- **Routing by model.** A request goes to the pool that has the requested
+  model resident or listed in its `supported_models`; a model no pool serves
+  is refused (`no pool on this worker serves model '…'`). Requests that name
+  no model (`"default"`) go to the first pool.
+- **Per-pool limits.** `max_images_per_prompt` / `max_image_pixels` (vision),
+  `max_images_per_generation` (image generation, default 1), `max_steps`
+  (denoising steps one image request may ask for, default 50) and
+  `default_steps` (steps for a request that names none; default by model —
+  4 for distilled turbo / lightning / schnell models, 25 otherwise), `max_audio_sec`
+  (ASR, default 600), `max_chars` and `tts_voice` (TTS, defaults 4000 and
+  `af_heart`). Set them no lower than the per-model caps the gateway
+  publishes in `/v1/catalog`, or in-catalog requests are refused here.
+- **Status.** `GET /health` reports `features` as the union over pools
+  (`vision`, `image_gen`, `asr`, `tts`), every resident model under
+  `loaded_models`, and per pool — state, devices, models, features, limits
+  and switch targets — under `multi_gpu.pools`.
+
+**Yield and resume across pools.** Mining takes every card, so a yield
+pauses all pools at once, and the worker reports `paused` (`engine_state`)
+only when **every** pool has released its cards; until then it reports
+`unloading`. A graceful yield lets running requests finish first; an
+immediate yield stops an image render between denoising steps and speech
+work at a segment boundary, and the interrupted request gets a `503` with
+`Retry-After` and is not billed. On resume the image and speech pools
+reload first (seconds each), then the vLLM pools one at a time; a new yield
+arriving mid-resume stops the resume before the next pool loads.
+
+**Receipts for every unit.** Every billed response carries an ed25519-signed
+receipt for the gateway (the `X-OM-Receipt` header on non-streaming responses;
+the public key is on `/health` as `receipt_pubkey`). Token-billed responses
+attest the token counts. Image, speech-recognition and speech-synthesis
+responses attest a `quantity` and an `asset_hash`: the sha256 of the delivered
+PNG bytes (concatenated in order when several images are returned), of the
+returned WAV, or of the uploaded audio for a transcription. The receipt does
+not name its unit — the unit comes from the model's catalog entry on the
+gateway, which re-measures the quantity and re-hashes the bytes itself and
+refuses a receipt that disagrees.
 
 ## Join a gateway (self-registration)
 
@@ -201,7 +284,9 @@ curl -s -H "Authorization: Bearer $SCHEDULER_TOKEN" http://127.0.0.1:9090/regist
   ```
 
   One request per model per 10 minutes; the reset clears accumulated evidence
-  too, so retrying never stacks luck.
+  too, so retrying never stacks luck. A model that is already verified answers
+  `"status": "already_verified"` — there is nothing to re-examine, and the
+  10-minute allowance is not used.
 
 ## GPU yield behaviour
 
@@ -213,30 +298,30 @@ curl -s -H "Authorization: Bearer $SCHEDULER_TOKEN" http://127.0.0.1:9090/regist
 - While yielded, the API answers `503` with an honest `Retry-After` estimate.
 - `GET /ready` reports `seconds_until_change` — while servable, the seconds until
   the next scheduled yield begins; while mining, the estimated seconds until
-  resume. Gateways use this to route long requests away from imminent yields.
+  resume. The field is omitted when no estimate exists (for example right after a
+  proof completes). Gateways use this to route long requests away from imminent yields.
 
-## What's new in v1.3.0
+## What's new in v1.5.0
 
-See [UPDATE-NOTES.md](UPDATE-NOTES.md) for the full list and upgrade caveats.
+See [UPDATE-NOTES.md](UPDATE-NOTES.md) for the full list and upgrade steps.
 Highlights:
 
-- **Self-registration**: challenge → miner-key signature → per-worker token,
-  fully worker-initiated; token rotation on re-registration.
-- **Certificate-at-registration + built-in TLS fronts** (38443/39443):
-  encrypted gateway→worker transport with identities decoupled from addresses;
-  automatic renewal at half-life.
-- **Worker→gateway HTTPS**: `gateway.url: https://…` verified against the same
-  registration CA (identity = gateway_id); `tls_ca_path` bootstraps the first
-  registration; fail-closed without a CA.
-- **Dynamic per-worker tokens** pushed to the inference container; accepted
-  alongside the static token.
-- **Claimed model list + on-demand switching**: `supported_models` reaches the
-  gateway's model-aware router; local path-named weights resolve correctly.
-- **Admission self-service**: per-model verification status, the exact floor,
-  and a rate-limited re-verification trigger — all from the worker's own box.
-- **Chat template rendering** (fix): conversations render with the model's own
-  template — no more transcript-continuation artifacts or leaked reasoning
-  blocks; noticeably better answers, especially on Qwen3-class models.
+- **Multimodal engines**: image understanding through vLLM, image generation
+  (`diffusion`), speech recognition (`asr`) and speech synthesis (`tts`), each
+  on its OpenAI-shaped endpoint.
+- **Multi-pool workers**: several pools on disjoint cards in one worker, each
+  with its own model, limits and switch targets; opt-in card sharing for small
+  speech engines; one all-or-nothing mining yield.
+- **Asset receipts**: image and speech responses are signed with a
+  `quantity` and the sha256 of the delivered (or uploaded) bytes, for billing
+  in `image`, `audio_second` and `character` units.
+- **Model checks at start-up and switch**: switch targets must match their
+  pool's engine kind; quantized weights must be served under an id naming the
+  quantization; a failed switch reloads the previous model.
+- **Stalled-chain fail-safe**: a Lotus node that answers RPC but whose chain
+  head stops advancing (`scheduler.chain_stale_after_sec`, default 600) is
+  treated as disconnected, so the GPUs still yield under
+  `fail_safe_on_disconnect`.
 
 ## Build from source
 
@@ -249,8 +334,9 @@ docker build -t openmodel-foc-bridge:latest src/foc-bridge
 ```
 
 Note: build the inference image on an x86_64 host with NVIDIA tooling; the
-resulting image is ~17 GB (CUDA 13 + PyTorch + vLLM 0.22); on GitHub
-Releases it ships gzip-compressed as six ~1.5 GB split volumes.
+resulting image is ~19 GB (CUDA 13 + PyTorch + vLLM 0.22 + the image-generation and
+speech libraries); on GitHub Releases it ships gzip-compressed as split volumes
+(see `release/SHA256SUMS.txt` for the list).
 
 ## Troubleshooting
 
@@ -266,8 +352,20 @@ Releases it ships gzip-compressed as six ~1.5 GB split volumes.
   `Retry-After`.
 - **401 from inference after a restart**: the dynamic token is pushed by the
   scheduler within a few seconds of (re)registration; if it persists, check
-  `/registration` → `gateway_link` and that scheduler and inference are both
-  v1.3.0 (mixed versions cannot exchange dynamic tokens).
+  `/registration` → `gateway_link` and that scheduler and inference run the
+  same release (mixed versions cannot exchange dynamic tokens).
+- **`GPU <n> is assigned to both pool '<a>' and pool '<b>'`** at start-up: two
+  pools list the same card. Give each pool its own cards, or set
+  `share_devices: true` on every pool sharing it (small speech engines only).
+- **`model '…' is a <kind> model and cannot be loaded by this pool's '<engine>' engine`**:
+  a model is listed in a pool whose engine cannot load it. Move it to a pool
+  with the named engine.
+- **`quantized models must be served under their own id`**: the weights are
+  quantized but the model id names a full-precision model. Serve them under
+  the quantized repository's name.
+- **Log line `lotus chain head is not advancing`**: Lotus answers RPC but its
+  chain has not moved for `scheduler.chain_stale_after_sec` (default 600 s);
+  the worker yields as if Lotus were disconnected. Check `lotus sync status`.
 - **`gateway_link: unreachable` vs `silent`**: `unreachable` means this worker
   cannot reach the gateway (network/mapping); `silent` means the gateway is
   reachable but no longer polling this worker (deregistered?) — re-register or
@@ -275,7 +373,11 @@ Releases it ships gzip-compressed as six ~1.5 GB split volumes.
 
 ## Versions
 
-- **v1.4.0** (this release): per-request thinking mode
+- **v1.5.0** (this release): multimodal engines (image understanding, image
+  generation, speech recognition, speech synthesis), multi-pool workers,
+  asset receipts, engine-kind and quantization-id checks, switch rollback,
+  stalled-chain fail-safe.
+- v1.4.0: per-request thinking mode
   (`enable_thinking` → `reasoning_content`), `qwen3.8-27b` catalog entry,
   `tls_system_ca` domain trust mode for worker→gateway, `init: true` in the
   compose file (PID-1 zombie protection), config templates rebuilt around the
@@ -287,6 +389,11 @@ Releases it ships gzip-compressed as six ~1.5 GB split volumes.
   WindowPoSt detection.
 - v1.0.0: initial release.
 
-Compatible gateway: openmodel-gateway v2.1+ (self-registration, certificate
-issuance, admission probes). Older gateways work; the new surfaces stay dormant
-and the worker serves with its static token.
+Compatible gateway: openmodel-gateway v2.2+ (asset receipts, image and
+speech routing, per-modality admission probes). Text serving works against
+v2.1; older gateways work too, with the newer surfaces dormant and the worker
+serving with its static token.
+
+## License
+
+Copyright 2026 6block. Licensed under the [Apache License, Version 2.0](LICENSE).

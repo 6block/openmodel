@@ -1,6 +1,8 @@
 package scheduler
 
 import (
+	"time"
+
 	"openmodel/go-scheduler/internal/config"
 	"openmodel/go-scheduler/internal/lotus"
 
@@ -12,6 +14,9 @@ type YieldPolicy struct {
 	WindowPost           config.WindowPostPolicy
 	WinningPost          config.WinningPostPolicy
 	FailSafeOnDisconnect bool
+	// ChainStaleAfter: a chain head that has not advanced for this long is treated
+	// like a disconnect (see config.SchedulerConfig.ChainStaleAfterSec). <=0 disables.
+	ChainStaleAfter time.Duration
 }
 
 // YieldDecision represents the scheduler's decision about GPU state.
@@ -36,10 +41,11 @@ func (p *YieldPolicy) EvaluateWindowPost(info *lotus.DeadlineInfo) YieldDecision
 			}
 		}
 		return YieldDecision{
-			State:   StateAvailable,
-			Urgency: pb.YieldUrgency_YIELD_URGENCY_NORMAL,
-			Reason:  pb.YieldReason_YIELD_REASON_UNKNOWN,
-			Message: "lotus disconnected, no fail-safe",
+			State:                  StateAvailable,
+			Urgency:                pb.YieldUrgency_YIELD_URGENCY_NORMAL,
+			Reason:                 pb.YieldReason_YIELD_REASON_UNKNOWN,
+			Message:                "lotus disconnected, no fail-safe",
+			SecondsUntilNextChange: untilChangeUnknown,
 		}
 	}
 
@@ -96,9 +102,10 @@ func (p *YieldPolicy) EvaluateWindowPost(info *lotus.DeadlineInfo) YieldDecision
 func (p *YieldPolicy) EvaluateWinningPost(baseInfo *lotus.MinerBaseInfo) YieldDecision {
 	if !p.WinningPost.Enabled || baseInfo == nil {
 		return YieldDecision{
-			State:   StateAvailable,
-			Reason:  pb.YieldReason_YIELD_REASON_RESUME,
-			Message: "WinningPoSt check: not eligible or disabled",
+			State:                  StateAvailable,
+			Reason:                 pb.YieldReason_YIELD_REASON_RESUME,
+			Message:                "WinningPoSt check: not eligible or disabled",
+			SecondsUntilNextChange: untilChangeUnknown,
 		}
 	}
 
@@ -113,8 +120,16 @@ func (p *YieldPolicy) EvaluateWinningPost(baseInfo *lotus.MinerBaseInfo) YieldDe
 	}
 
 	return YieldDecision{
-		State:   StateAvailable,
-		Reason:  pb.YieldReason_YIELD_REASON_RESUME,
-		Message: "WinningPoSt check: not elected",
+		State:                  StateAvailable,
+		Reason:                 pb.YieldReason_YIELD_REASON_RESUME,
+		Message:                "WinningPoSt check: not elected",
+		SecondsUntilNextChange: untilChangeUnknown,
 	}
 }
+
+// untilChangeUnknown marks a decision whose horizon is not computed here (resume
+// after a proof, WinningPoSt checks, …). Left at the zero value it read as "the
+// next yield starts in 0 s", and the gateway's predictive routing cut the worker
+// to 5% weight for as long as that decision stood — on a test worker the whole rest of a
+// WindowPoSt deadline after its proof finished. /ready omits a negative value.
+const untilChangeUnknown = -1

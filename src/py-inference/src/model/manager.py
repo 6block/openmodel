@@ -15,14 +15,40 @@ def is_model_complete(path: Path) -> bool:
     """A cached model directory is usable only if it has a config AND at least one
     weight file (or a shard index). This guards against a half-written directory left
     by a crashed/partial download being treated as a valid cache, which would make
-    vLLM fail to start forever (audit MEDIUM fix)."""
+    the engine fail to start forever (audit MEDIUM fix).
+
+    Two layouts are recognised, because two engine families use them:
+
+      * transformers/vLLM: a `config.json` plus weight files.
+      * diffusers (image generation): a `model_index.json` — which is diffusers'
+        own layout descriptor — plus the component subdirectories it names.
+
+    Speech checkpoints use the same `config.json` + weights shape with their own
+    extensions: Kokoro ships `kokoro-v1_0.pth`, CTranslate2 (faster-whisper) `model.bin`.
+    An unrecognised weight extension does not just fail the check — the caller deletes
+    the directory as a crashed download — so every weight format an engine loads must
+    be listed here.
+
+    The diffusers case is not cosmetic. `model_index.json` does NOT match the
+    `*.index.json` glob (the name ends in `index.json`, not `.index.json`... it is
+    `model_index.json`, so a `config.json`-only check rejects it), so without this
+    branch a perfectly good diffusion model would be judged corrupt and DELETED and
+    re-downloaded on every start.
+    """
     if not path.is_dir():
         return False
-    if not (path / "config.json").exists():
-        return False
-    for pattern in ("*.safetensors", "*.bin", "*.pt", "*.gguf", "*.index.json"):
-        if any(path.glob(pattern)):
-            return True
+    has_transformers = (path / "config.json").exists() and any(
+        any(path.glob(p)) for p in ("*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf", "*.index.json")
+    )
+    if has_transformers:
+        return True
+    # diffusers layout: model_index.json names the components (unet, vae, text_encoder…).
+    # Require the descriptor plus at least one component directory that itself looks
+    # populated, so a directory holding only the descriptor is still treated as partial.
+    if (path / "model_index.json").exists():
+        for child in path.iterdir():
+            if child.is_dir() and any(child.glob("*.safetensors")):
+                return True
     return False
 
 
@@ -68,6 +94,11 @@ class ModelManager:
         if is_model_complete(cached):
             return cached
         return None
+
+    def present_path(self, model_id: str) -> str | None:
+        """Local path of a complete copy of model_id, or None (no download)."""
+        p = self._present_path(model_id)
+        return str(p) if p else None
 
     async def ensure_model(self, model_id: str) -> str:
         """Ensure a model is available locally. Returns the local path."""

@@ -49,6 +49,10 @@ async def main():
 
     # Create inference engine pool (supports single or multi-GPU)
     engine = create_engine_pool(cfg)
+    if cfg.pools:
+        logger.info("multi-pool worker: %s",
+                    ", ".join(f"{p.name}={p.inference.engine}@{p.inference.multi_gpu.device_ids}"
+                              for p in cfg.pools))
     logger.info("engine pool created",
                 extra={"mode": cfg.inference.multi_gpu.mode,
                        "gpu_count": cfg.inference.multi_gpu.gpu_count,
@@ -89,8 +93,29 @@ async def main():
         logger.warning("could not connect to scheduler, deferring model load for safety",
                        extra={"error": str(e)})
 
-    # Load model only if GPU is available; otherwise start paused
-    model_path = await model_manager.ensure_model(cfg.inference.model)
+    # Load model only if GPU is available; otherwise start paused. A multi-pool
+    # worker resolves every pool's model (each may need an FOC download) and records
+    # the local path on the pool before starting; the start() argument then only
+    # names the primary pool's model.
+    from src.model.quant_identity import check_quant_identity
+    from src.model.model_kind import check_engine_fits
+    if cfg.pools:
+        for pc, pool in zip(cfg.pools, engine.pools):
+            path = await model_manager.ensure_model(pc.inference.model)
+            check_quant_identity(pc.inference.model, path)
+            check_engine_fits(pc.inference.engine, pc.inference.model, path)
+            for e in pool.engine._engines:
+                e._model = path
+        model_path = engine.current_model
+    else:
+        model_path = await model_manager.ensure_model(cfg.inference.model)
+        check_quant_identity(cfg.inference.model, model_path)
+        check_engine_fits(cfg.inference.engine, cfg.inference.model, model_path)
+    # Switch targets already on disk are checked now, so a misplaced entry stops the
+    # worker at startup with a clear reason instead of failing its first request.
+    # Targets not yet downloaded are checked when a switch resolves them.
+    from src.model.model_kind import check_switch_targets
+    check_switch_targets(cfg, model_manager.present_path)
     if gpu_available:
         await engine.start(model_path)
         logger.info("engine started", extra={"model": model_path})

@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,69 @@ class GenerateResult:
     completion_tokens: int = 0
     finish_reason: str = "stop"  # "stop" or "length"
     cached_tokens: int = 0       # Prompt tokens served from vLLM's prefix cache
+    # images holds the produced artifacts for a generation engine (PNG bytes), empty for
+    # a text engine. The bytes are what gets billed: the gateway re-hashes them and the
+    # receipt commits that hash, so they must be the exact bytes the client receives.
+    images: list = field(default_factory=list)
+
+
+def _mock_png(seed: int = 0) -> bytes:
+    """A tiny valid PNG, distinct per `seed`.
+
+    Real decodable bytes rather than a placeholder string: the image path hashes and
+    returns these, and a test that cannot decode its own fixture would not be testing
+    the real shape. Encoded with the standard library only, so it needs no Pillow.
+    """
+    import struct
+    import zlib
+
+    size = 2
+    # A 2x2 RGB image; the red channel varies with the seed so each image hashes
+    # differently. Each scanline is a filter byte (0) followed by `size` RGB triples.
+    def _row(y: int) -> bytes:
+        return b"\x00" + b"".join(
+            bytes([(seed * 60 + x * 20 + y * 5) % 256, 90, 160]) for x in range(size)
+        )
+
+    raw = b"".join(_row(y) for y in range(size))
+
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)  # 8-bit RGB
+    return (b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", zlib.compress(raw))
+            + _chunk(b"IEND", b""))
+
+
+def query_gpu_free_ratio(gpu_id: int) -> float | None:
+    """Free VRAM ratio for a specific physical GPU, via nvidia-smi.
+
+    Uses nvidia-smi rather than torch.cuda.mem_get_info(): the latter depends on the CUDA
+    context, which binds to whichever GPU was initialised first — unreliable in
+    multi-instance mode, where it can report a sibling's memory.
+
+    Module-level so every engine class can share one implementation; returns None when
+    nvidia-smi is unavailable (dev box, mock), which callers treat as "cannot confirm"
+    rather than "not released".
+    """
+    try:
+        import subprocess as sp
+        result = sp.run(
+            ["nvidia-smi", "--query-gpu=memory.free,memory.total",
+             "--format=csv,noheader,nounits", f"--id={gpu_id}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        parts = result.stdout.strip().split(",")
+        free_mib = float(parts[0].strip())
+        total_mib = float(parts[1].strip())
+        return free_mib / total_mib if total_mib > 0 else None
+    except Exception:
+        return None
 
 
 @dataclass
@@ -55,6 +118,31 @@ class StreamChunk:
     prompt_tokens: int = 0       # Set only on the last chunk
     completion_tokens: int = 0   # Set only on the last chunk
     cached_tokens: int = 0       # Set only on the last chunk (prefix-cache hits)
+
+
+def _config_is_vlm(model_config) -> bool:
+    """True if a HF model config describes an image-understanding model: it carries
+    a vision sub-config, or its architecture name is a *ForConditionalGeneration
+    multimodal class. Text-only models (Qwen3ForCausalLM etc.) return False."""
+    if getattr(model_config, "vision_config", None) is not None:
+        return True
+    archs = getattr(model_config, "architectures", None) or []
+    return any("VL" in a or "Vision" in a for a in archs)
+
+
+def _vllm_prompt(prompt: str, images):
+    """Build the first positional argument for `AsyncLLMEngine.generate(...)`.
+
+    Text-only requests pass the bare string (unchanged behaviour). A VLM request
+    wraps it in vLLM's TextPrompt dict with the decoded PIL images under
+    `multi_modal_data["image"]` — vLLM 0.22's generate() has NO separate
+    multimodal keyword; the images must ride inside the prompt object. The
+    chat template has already emitted the model's image placeholder tokens
+    into `prompt`, so text and pixels line up 1:1 in order.
+    """
+    if not images:
+        return prompt
+    return {"prompt": prompt, "multi_modal_data": {"image": list(images)}}
 
 
 def _extract_cached_tokens(request_output, prompt_tokens: int) -> int:
@@ -128,6 +216,27 @@ class InferenceEngine(ABC):
         return ""
 
 
+def _sampling_kwargs(kwargs: dict) -> dict:
+    """vLLM SamplingParams keyword arguments for one request."""
+    sp = dict(
+        max_tokens=kwargs.get("max_tokens", 256),
+        temperature=kwargs.get("temperature", 0.7),
+        top_p=kwargs.get("top_p", 0.95),
+    )
+    stop = kwargs.get("stop")
+    if stop is not None:
+        sp["stop"] = [stop] if isinstance(stop, str) else stop
+    for name in ("seed", "presence_penalty", "frequency_penalty"):
+        if kwargs.get(name) is not None:
+            sp[name] = kwargs[name]
+    structured = kwargs.get("structured")
+    if structured:
+        from vllm.sampling_params import StructuredOutputsParams
+        # Compact JSON is set engine-wide (structured_outputs_config at engine creation).
+        sp["structured_outputs"] = StructuredOutputsParams(**structured)
+    return sp
+
+
 class VLLMEngine(InferenceEngine):
     """Production engine wrapping vLLM's AsyncLLMEngine.
 
@@ -140,7 +249,8 @@ class VLLMEngine(InferenceEngine):
                  max_model_len: int = 4096,
                  tensor_parallel_size: int = 1,
                  device_ids: list[int] | None = None,
-                 enforce_eager: bool = False):
+                 enforce_eager: bool = False,
+                 max_images_per_prompt: int = 1, max_image_pixels: int = 0):
         self._state = EngineState.STOPPED
         self._engine = None
         self._model = ""
@@ -149,6 +259,11 @@ class VLLMEngine(InferenceEngine):
         self._tensor_parallel_size = tensor_parallel_size
         self._device_ids = device_ids
         self._enforce_eager = enforce_eager
+        # Image-understanding models: per-request image cap passed to vLLM as
+        # limit_mm_per_prompt. Only applied when the loaded model is a VLM.
+        self._max_images_per_prompt = max(1, int(max_images_per_prompt))
+        self._max_image_pixels = max(0, int(max_image_pixels))
+        self._is_vlm = False  # set on (re)load from the model config
         self._active_requests = 0
         self._inflight_request_ids: set[str] = set()
 
@@ -202,11 +317,23 @@ class VLLMEngine(InferenceEngine):
 
             # Set CUDA_VISIBLE_DEVICES every time (not just on start),
             # so that resume also targets the correct GPU.
+            prev_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
             if self._device_ids is not None:
                 cuda_devices = ",".join(str(d) for d in self._device_ids)
                 os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
                 logger.info("set CUDA_VISIBLE_DEVICES=%s", cuda_devices)
-            await self._create_engine_inner()
+            try:
+                await self._create_engine_inner()
+            finally:
+                # The engine core subprocess has its own copy of the environment by
+                # now. Restore the process-wide value so in-process engines of other
+                # pools (diffusion, speech) that address physical cards — cuda:4 —
+                # still see every card when they initialize CUDA later.
+                if self._device_ids is not None:
+                    if prev_visible is None:
+                        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                    else:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = prev_visible
 
             try:
                 self._child_pids = {c.pid for c in multiprocessing.active_children()} - pre_existing
@@ -223,6 +350,7 @@ class VLLMEngine(InferenceEngine):
         # Auto-adapt max_model_len: if model's max_position_embeddings is smaller
         # than configured max_model_len, use the model's limit instead.
         effective_max_model_len = self._max_model_len
+        is_vlm = False
         try:
             from transformers import AutoConfig
             model_config = AutoConfig.from_pretrained(self._model, trust_remote_code=True)
@@ -231,8 +359,38 @@ class VLLMEngine(InferenceEngine):
                 logger.info("adapting max_model_len: %d -> %d (model limit)",
                             effective_max_model_len, model_max)
                 effective_max_model_len = model_max
+            is_vlm = _config_is_vlm(model_config)
         except Exception as e:
             logger.debug("could not read model config for max_model_len: %s", e)
+
+        self._effective_max_model_len = effective_max_model_len
+        extra = {}
+        if is_vlm:
+            # Image-understanding model: cap the number of images per request so the
+            # vision encoder's activation budget is bounded on 10 GB cards, and so a
+            # client cannot submit an unbounded batch of images in one message.
+            extra["limit_mm_per_prompt"] = {"image": self._max_images_per_prompt}
+            if self._max_image_pixels:
+                # Qwen2-VL-style processors read max_pixels; Qwen3-VL's ignores it and
+                # bounds images by size.longest_edge (also a pixel count, default 16.7 M:
+                # a 12 MP photo became ~11.8k visual tokens and overflowed an 8k context).
+                extra["mm_processor_kwargs"] = {
+                    "max_pixels": self._max_image_pixels,
+                    "size": {"longest_edge": self._max_image_pixels, "shortest_edge": 65536},
+                }
+            logger.info("vision-language model detected — accepting up to %d image(s) per request",
+                        self._max_images_per_prompt)
+        self._is_vlm = is_vlm
+        # JSON response formats decode compact JSON. With free whitespace allowed a small
+        # model can emit newlines inside the object until max_tokens runs out (a 4B model:
+        # ~1 request in 10). vLLM reads this switch only from the engine config, not from
+        # per-request parameters, and only the xgrammar / guidance backends honour it.
+        try:
+            from vllm.config import StructuredOutputsConfig
+            extra["structured_outputs_config"] = StructuredOutputsConfig(
+                backend="xgrammar", disable_any_whitespace=True)
+        except Exception as e:  # pragma: no cover - vLLM without the config class
+            logger.debug("structured output config not applied: %s", e)
 
         args = AsyncEngineArgs(
             model=self._model,
@@ -242,8 +400,13 @@ class VLLMEngine(InferenceEngine):
             trust_remote_code=True,
             enforce_eager=self._enforce_eager,
             enable_prefix_caching=True,  # report num_cached_tokens for cache-read billing (V1 default; set explicitly to be deterministic)
+            **extra,
         )
-        self._engine = AsyncLLMEngine.from_engine_args(args)
+        # Off the event loop: building the engine blocks for tens of seconds (core
+        # subprocess spawn, weight load, KV profiling). On the loop it froze /health —
+        # the gateway saw a dead worker for ~10 s on every resume — and every other
+        # pool's requests. The creation lock held by the caller still serializes it.
+        self._engine = await asyncio.to_thread(AsyncLLMEngine.from_engine_args, args)
 
     async def _destroy_engine(self) -> None:
         """Destroy the vLLM engine and release all GPU memory.
@@ -273,7 +436,11 @@ class VLLMEngine(InferenceEngine):
             # Shutdown the engine
             if hasattr(self._engine, 'shutdown'):
                 try:
-                    self._engine.shutdown()
+                    # shutdown() blocks for seconds while the core subprocess exits. Off
+                    # the event loop: in a multi-pool worker every other pool's pause
+                    # runs on this loop, and blocking it delays their release (seen on
+                    # a test worker: the image pool did not even start pausing for 5s).
+                    await asyncio.to_thread(self._engine.shutdown)
                 except Exception as e:
                     logger.warning("engine shutdown error (non-fatal): %s", e)
             self._engine = None
@@ -326,25 +493,11 @@ class VLLMEngine(InferenceEngine):
     def _query_gpu_free_ratio(self, gpu_id: int) -> float | None:
         """Query free VRAM ratio for a specific physical GPU via nvidia-smi.
 
-        Uses nvidia-smi instead of torch.cuda.mem_get_info() because the
-        latter depends on CUDA context which is bound to whichever GPU was
-        first visible — unreliable in multi-instance mode.
+        Delegates to the module-level helper so the diffusion engine shares one
+        implementation. Kept as a method because existing tests override it on the
+        instance to script a sequence of readings.
         """
-        try:
-            import subprocess as sp
-            result = sp.run(
-                ["nvidia-smi", "--query-gpu=memory.free,memory.total",
-                 "--format=csv,noheader,nounits", f"--id={gpu_id}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode != 0:
-                return None
-            parts = result.stdout.strip().split(",")
-            free_mib = float(parts[0].strip())
-            total_mib = float(parts[1].strip())
-            return free_mib / total_mib if total_mib > 0 else None
-        except Exception:
-            return None
+        return query_gpu_free_ratio(gpu_id)
 
     async def _wait_for_vram_release(self, timeout: float = 20.0) -> None:
         """Wait until GPU VRAM is actually released.
@@ -644,6 +797,24 @@ class VLLMEngine(InferenceEngine):
     def current_model(self) -> str:
         return self._model
 
+    @property
+    def is_vlm(self) -> bool:
+        """True while the loaded model accepts image parts (set from its config on load)."""
+        return self._is_vlm
+
+    @property
+    def max_images_per_prompt(self) -> int:
+        """Per-request image cap handed to vLLM (limit_mm_per_prompt) for VLMs."""
+        return self._max_images_per_prompt
+
+    @property
+    def context_limit(self) -> int:
+        """Tokens one request may use (prompt + output) on this engine: the
+        configured max_model_len, lowered to the model's own limit when smaller.
+        Advertised in /health so a gateway with several workers for one model can
+        avoid sending a long request to the one that cannot hold it."""
+        return int(getattr(self, "_effective_max_model_len", 0) or self._max_model_len or 0)
+
     def is_available(self) -> bool:
         # _accepting goes False while a model switch drains this engine:
         # no NEW requests are routed here, but in-flight ones finish normally.
@@ -742,24 +913,15 @@ class VLLMEngine(InferenceEngine):
         from vllm import SamplingParams
 
         request_id = f"req-{_uuid.uuid4().hex[:12]}"
+        images = kwargs.pop("images", None) or None
 
-        sp_kwargs = dict(
-            max_tokens=kwargs.get("max_tokens", 256),
-            temperature=kwargs.get("temperature", 0.7),
-            top_p=kwargs.get("top_p", 0.95),
-        )
-        stop = kwargs.get("stop")
-        if stop is not None:
-            if isinstance(stop, str):
-                stop = [stop]
-            sp_kwargs["stop"] = stop
-
-        sampling_params = SamplingParams(**sp_kwargs)
+        sampling_params = SamplingParams(**_sampling_kwargs(kwargs))
 
         self._active_requests += 1
         self._inflight_request_ids.add(request_id)
         try:
-            results_generator = self._engine.generate(prompt, sampling_params, request_id)
+            results_generator = self._engine.generate(
+                _vllm_prompt(prompt, images), sampling_params, request_id)
             final_output = None
             async for request_output in self._iter_outputs(results_generator, request_id):
                 # Check if we got paused mid-generation
@@ -823,25 +985,16 @@ class VLLMEngine(InferenceEngine):
         from vllm import SamplingParams
 
         request_id = f"req-{_uuid.uuid4().hex[:12]}"
+        images = kwargs.pop("images", None) or None
 
-        sp_kwargs = dict(
-            max_tokens=kwargs.get("max_tokens", 256),
-            temperature=kwargs.get("temperature", 0.7),
-            top_p=kwargs.get("top_p", 0.95),
-        )
-        stop = kwargs.get("stop")
-        if stop is not None:
-            if isinstance(stop, str):
-                stop = [stop]
-            sp_kwargs["stop"] = stop
-
-        sampling_params = SamplingParams(**sp_kwargs)
+        sampling_params = SamplingParams(**_sampling_kwargs(kwargs))
 
         self._active_requests += 1
         self._inflight_request_ids.add(request_id)
         prev_text = ""
         try:
-            results_generator = self._engine.generate(prompt, sampling_params, request_id)
+            results_generator = self._engine.generate(
+                _vllm_prompt(prompt, images), sampling_params, request_id)
             final_output = None
             async for request_output in self._iter_outputs(results_generator, request_id):
                 if self._state != EngineState.RUNNING:
@@ -897,14 +1050,36 @@ class MockEngine(InferenceEngine):
     """Mock engine for local development without GPU.
 
     Simulates model unload/reload delays to match VLLMEngine behavior.
+
+    `image_gen` switches it into the image-generation shape (advertises image_gen,
+    returns image bytes instead of text) so the /v1/images/generations path and its
+    billing are exercisable without diffusers or a GPU.
     """
 
-    def __init__(self, latency_sec: float = 0.5, gpu_id: int = 0):
+    def __init__(self, latency_sec: float = 0.5, gpu_id: int = 0, image_gen: bool = False):
         self._state = EngineState.STOPPED
         self._model = ""
         self._active_requests = 0
         self._latency = latency_sec
         self._gpu_id = gpu_id
+        self._image_gen = image_gen
+        self._max_images_per_request = 4
+
+    @property
+    def is_vlm(self) -> bool:
+        return False
+
+    @property
+    def is_image_gen(self) -> bool:
+        return self._image_gen
+
+    @property
+    def max_images_per_prompt(self) -> int:
+        return 0
+
+    @property
+    def max_images_per_request(self) -> int:
+        return self._max_images_per_request
 
     async def start(self, model_path: str) -> None:
         self._state = EngineState.STARTING
@@ -976,6 +1151,18 @@ class MockEngine(InferenceEngine):
         self._active_requests += 1
         try:
             await asyncio.sleep(self._latency)
+            if self._image_gen:
+                # Deterministic tiny PNGs, distinct per image, so tests can assert the
+                # asset digest and the image count without a real render.
+                n = int(kwargs.get("n", 1) or 1)
+                if n > self._max_images_per_request:
+                    raise ValueError(
+                        f"too many images: {n} requested, at most {self._max_images_per_request}")
+                return GenerateResult(
+                    text="",
+                    finish_reason="stop",
+                    images=[_mock_png(i) for i in range(n)],
+                )
             max_tokens = kwargs.get("max_tokens", 50)
             text = (f"[GPU-{self._gpu_id} Mock response to: {prompt[:50]}...] "
                     + "token " * min(max_tokens, 20))
@@ -1011,10 +1198,11 @@ def create_engine(engine_type: str, **kwargs) -> InferenceEngine:
     """Factory function to create a single inference engine.
 
     Args:
-        engine_type: "mock" or "vllm"
+        engine_type: "mock", "vllm", "diffusion", "asr" or "tts"
         device_ids: List of CUDA device IDs this engine should use
         gpu_id: Mock GPU identifier (mock mode only)
         gpu_memory_utilization, max_model_len, tensor_parallel_size: vLLM params
+        max_images_per_request: diffusion params
     """
     if engine_type == "mock":
         return MockEngine(
@@ -1028,6 +1216,35 @@ def create_engine(engine_type: str, **kwargs) -> InferenceEngine:
             tensor_parallel_size=kwargs.get("tensor_parallel_size", 1),
             device_ids=kwargs.get("device_ids"),
             enforce_eager=kwargs.get("enforce_eager", False),
+            max_images_per_prompt=kwargs.get("max_images_per_prompt", 1),
+            max_image_pixels=kwargs.get("max_image_pixels", 0),
+        )
+    elif engine_type == "diffusion":
+        # Imported here rather than at module scope so a text-only worker never pays
+        # for importing diffusers (and does not fail if it is not installed).
+        from .diffusion_engine import DiffusionEngine
+        return DiffusionEngine(
+            device_ids=kwargs.get("device_ids"),
+            gpu_memory_utilization=kwargs.get("gpu_memory_utilization", 0.85),
+            max_images_per_request=kwargs.get("max_images_per_request", 1),
+            max_steps=kwargs.get("max_steps", 50),
+            default_steps=kwargs.get("default_steps", 0),
+        )
+    elif engine_type in ("asr", "tts"):
+        # Speech pools: faster-whisper / Kokoro, imported lazily for the same reason
+        # as diffusers — a text-only worker must not need them installed.
+        from .speech_engine import AsrEngine, TtsEngine
+        if engine_type == "asr":
+            return AsrEngine(
+                device_ids=kwargs.get("device_ids"),
+                gpu_memory_utilization=kwargs.get("gpu_memory_utilization", 0.85),
+                max_audio_sec=kwargs.get("max_audio_sec", 600),
+            )
+        return TtsEngine(
+            device_ids=kwargs.get("device_ids"),
+            gpu_memory_utilization=kwargs.get("gpu_memory_utilization", 0.85),
+            max_chars=kwargs.get("max_chars", 4000),
+            default_voice=kwargs.get("tts_voice", ""),
         )
     else:
         raise ValueError(f"Unknown engine type: {engine_type}")

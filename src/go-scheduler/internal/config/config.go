@@ -91,6 +91,13 @@ type SchedulerConfig struct {
 	WindowPost           WindowPostPolicy  `yaml:"window_post"`
 	WinningPost          WinningPostPolicy `yaml:"winning_post"`
 	FailSafeOnDisconnect bool              `yaml:"fail_safe_on_disconnect"`
+	// ChainStaleAfterSec: if the chain head epoch Lotus reports has not advanced for
+	// this long, the node is treated as disconnected. A node that answers RPC but is
+	// stuck (e.g. it missed a network upgrade and rejects every new block) otherwise
+	// looks healthy while every deadline it reports is frozen — WindowPoSt is never
+	// seen approaching and the GPU is never yielded. Default 600s (~20 epochs; a
+	// healthy node advances every 30s). Negative disables the check.
+	ChainStaleAfterSec int `yaml:"chain_stale_after_sec"`
 }
 
 type WindowPostPolicy struct {
@@ -205,6 +212,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Scheduler.WindowPost.SectorCacheRefreshEpochs == 0 {
 		// ~3h. Was a hardcoded 2880 (~24h), too stale for actively-sealing miners.
 		cfg.Scheduler.WindowPost.SectorCacheRefreshEpochs = 360
+	}
+	if cfg.Scheduler.ChainStaleAfterSec == 0 {
+		cfg.Scheduler.ChainStaleAfterSec = 600
 	}
 	if cfg.Curio.ProofPollIntervalSec == 0 {
 		cfg.Curio.ProofPollIntervalSec = 5

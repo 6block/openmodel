@@ -1,4 +1,4 @@
-# SP Onboarding — Mainnet Alpha
+# Getting Started for SPs — Mainnet Alpha
 
 Complete steps to register a test SP with the OpenModel mainnet gateway. All
 gateway-side parameters are prefilled in config/sidecar-mainnet-alpha.yaml;
@@ -78,7 +78,8 @@ later.
 | Material | Location (inside the repository directory) |
 |---|---|
 | Image tarballs | three .tar.gz files under release/ |
-| Config template | config/sidecar-mainnet-alpha.yaml |
+| Config template | config/sidecar-mainnet-alpha.yaml (text models) |
+| Multi-pool template | config/sidecar-multipool-example.yaml (text + vision + image generation + speech; see step 5) |
 
 Enter the repository directory (all steps run from here):
 
@@ -242,6 +243,74 @@ the list is never routed here). Claiming a model your engine shape cannot load
 is safe but useless: the switch fails with a clean error and the weights still
 cost you disk.
 
+#### Serving vision, image-generation or speech models
+
+The template above serves text models from one vLLM engine. To serve other
+modalities, split the cards into **pools** — each pool its own cards, one
+engine, one resident model. Start from the multi-pool template instead of the
+mainnet-alpha one:
+
+```bash
+cp ~/openmodel/config/sidecar-multipool-example.yaml ~/openmodel/config/sidecar-multipool.yaml
+```
+
+and set `SIDECAR_CONFIG=sidecar-multipool.yaml` in .env. Its gateway section
+is the same mainnet-alpha gateway; fill the same <<< fields as in the table
+above, plus `gateway.gpu_count` (cards used across all pools).
+
+| `engine` | Serves | Weights layout the engine loads |
+|---|---|---|
+| `vllm` | text, and image understanding (vision models) | `config.json` naming an architecture + weights |
+| `diffusion` | image generation | diffusers layout: `model_index.json` + component directories |
+| `asr` | speech recognition | faster-whisper (CTranslate2): `model.bin` + `vocabulary.txt` or `vocabulary.json` |
+| `tts` | speech synthesis | Kokoro v1.0: `kokoro-v1_0.pth` + `voices/` |
+
+How to declare what you serve:
+
+- **Each pool** names its resident `model`, its `device_ids`, and in
+  `supported_models` the models it may switch to — only models of its own
+  engine kind. A model of another kind stops the worker at start-up (or
+  refuses the switch, if its weights arrive later) with:
+  model '…' is a diffusion model and cannot be loaded by this pool's 'vllm' engine.
+- **gateway.supported_models** lists every model of every pool — resident
+  models and switch targets. This is the list the gateway routes and probes;
+  each entry is admitted separately with a probe of its own modality (see
+  SP-GUIDE.md §5).
+- **Cards**: pools use disjoint cards. Two small speech pools may share one
+  card when both set `share_devices: true` (as the template's `asr` and `tts`
+  pools do).
+- **Limits**: `max_images_per_generation`, `max_steps` and `default_steps`
+  (image), `max_audio_sec` (ASR),
+  `max_chars` and `tts_voice` (TTS), `max_images_per_prompt` /
+  `max_image_pixels` (vision). Keep them at or above the per-model caps the
+  gateway publishes in `GET /v1/catalog`. The admission probe for image
+  generation renders 1024×1024; the TTS probe sends English text with no
+  voice, so `tts_voice` must be an English voice.
+
+Which models the network lists, and at what price, is published live by the
+gateway: `GET /v1/catalog` (authenticated with any user API key) returns each
+model's `id`, `modality` (`text`, `vision`, `image`, `asr`, `tts`) and
+`price_unit` (`token`, `image`, `audio_second`, `character`). Claim catalog
+ids, spelled as the catalog spells them, in the `/models/Org--Name` form.
+
+**Weights must be on disk, or fetchable.** Every pool's resident model is
+fetched before the API comes up; switch targets are fetched in the background
+after start-up. A model with an entry in `foc.real.piece_cid_registry` comes
+from Filecoin; any other `/models/Org--Name` entry is fetched from Hugging
+Face as `Org/Name` into the same directory (whole repository snapshot;
+`HF_TOKEN` in .env for gated repositories; `HF_FALLBACK=0` disables this).
+To control exactly which files land on disk — for example only the `fp16`
+variant of a diffusion model, which the engine loads in half precision when
+present — place the directory yourself under ~/openmodel/models/ before
+starting.
+
+**Quantized weights need a quantized id.** If a model's `config.json`
+carries a `quantization_config`, its id must name the quantization (`…-AWQ`,
+`…-FP8`, `…-4bit`, …). The worker refuses to start such weights under a
+full-precision id (quantized models must be served under their own id),
+because users pay that id's price for that model's quality. Models published
+only in a quantized form (gpt-oss, MXFP4) keep their official id.
+
 ### Step 6: verify registration on its own
 
 Run registration only, without starting the service:
@@ -254,7 +323,9 @@ docker run --rm --network host --env-file ~/openmodel/.env \
   -config /etc/sidecar/config.yaml -register-only
 ```
 
-(If the full stack is already running, log lines like
+(Using the multi-pool config? Mount it instead:
+-v ~/openmodel/config/sidecar-multipool.yaml:/etc/sidecar/config.yaml:ro.
+If the full stack is already running, log lines like
 mTLS front ... bind: address already in use are expected noise — the ports are
 held by the running service; the registration itself is unaffected.)
 
@@ -309,6 +380,16 @@ curl -s -X POST -H "Authorization: Bearer <token-from-above>" \
 ```
 
 One request per model per 10 minutes; a reset clears accumulated evidence too.
+
+On a multi-pool worker, also check that every pool is up on its own cards:
+
+```bash
+curl -s http://127.0.0.1:8000/health | python3 -c 'import json,sys; h=json.load(sys.stdin); print(h["engine_state"], h["features"]); [print(p["name"], p["engine_state"], p["devices"], p["models"]) for p in h["multi_gpu"]["pools"]]'
+```
+
+Each pool prints one line; `running` means it is serving. The top-level
+features list vision, image_gen, asr and tts for the modalities the worker
+serves.
 
 ---
 
@@ -380,6 +461,14 @@ use a larger card.
 Check the weight directory name and quantisation against the step-4 table;
 compare your score with the model's floor in /registration. Common causes:
 wrong quantisation, max_model_len too small (answers truncated), out of VRAM.
+For image and speech models: weights not in the layout their engine loads,
+the image pool running out of memory at 1024×1024, or a non-English default
+TTS voice.
+
+**GPU <n> is assigned to both pool '<a>' and pool '<b>'**
+Two pools list the same card. Give each pool its own device_ids, or set
+share_devices: true on every pool sharing that card (small speech engines
+only).
 
 When reporting a problem, attach the /registration output and the scheduler
 container logs.
@@ -392,7 +481,8 @@ container logs.
 |---|---|
 | Gateway | https://openmodel.filfox.info |
 | gateway_id | openmodel-mainnet |
-| Settlement contract (Filecoin mainnet) | 0x60D41baEaBe1ABE061AE82c44425debc35bA524A |
+| Settlement contract (Filecoin mainnet, v1.4) | 0x29b994f63D91e447945a1cDeA2776167B7415c26 |
+| Billing units | token, image, audio_second, character (per model: GET /v1/catalog) |
 | Settlement tokens | FIL, USDFC |
 | Admission floor | power ≥ 300 GiB, miner balance ≥ 1 FIL |
 | CA fingerprint (SHA256) | 49:1A:4F:DF:F7:6C:A2:56:7C:D3:15:0F:71:CE:C6:B9:C3:18:63:75:09:9E:B4:8C:1A:5E:2C:51:C7:4A:1F:73 |

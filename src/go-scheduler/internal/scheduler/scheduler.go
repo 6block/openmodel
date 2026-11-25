@@ -64,6 +64,16 @@ type Scheduler struct {
 
 	// When > 0, overrides the WinningPoSt resume delay (tests use a small value).
 	winningResumeDelay time.Duration
+
+	// Chain-head progress tracking. A Lotus that answers RPC but has stopped
+	// advancing (e.g. it missed a network upgrade and rejects every new block)
+	// reports the same frozen deadline forever, so no WindowPoSt ever looks
+	// "approaching". lastEpoch / lastAdvance let checkWindowPost notice that.
+	chainMu     sync.Mutex
+	lastEpoch   int64
+	lastAdvance time.Time
+	chainStale  bool
+	now         func() time.Time // injectable clock for tests
 }
 
 // SetOnStateChange registers a callback that fires whenever the GPU state
@@ -81,6 +91,48 @@ func New(lotusClient lotus.Client, policy YieldPolicy, logger *slog.Logger) *Sch
 		logger:            logger,
 		subscribers:       make(map[int]chan *pb.ScheduleEvent),
 		initRetryInterval: 5 * time.Second,
+		now:               time.Now,
+	}
+}
+
+// noteChainEpoch records the epoch Lotus just reported and returns how long the
+// chain head has been stuck (0 while it is advancing). The first observation only
+// arms the tracker: "stuck" is measured from when THIS scheduler first saw the
+// epoch, so a restart never reports a stale chain it has not watched.
+func (s *Scheduler) noteChainEpoch(epoch int64) time.Duration {
+	s.chainMu.Lock()
+	defer s.chainMu.Unlock()
+	now := s.now()
+	if s.lastAdvance.IsZero() || epoch > s.lastEpoch {
+		s.lastEpoch = epoch
+		s.lastAdvance = now
+		return 0
+	}
+	return now.Sub(s.lastAdvance)
+}
+
+// ChainStale reports whether the scheduler currently considers the Lotus chain
+// head stalled. Exposed for the health endpoint.
+func (s *Scheduler) ChainStale() bool {
+	s.chainMu.Lock()
+	defer s.chainMu.Unlock()
+	return s.chainStale
+}
+
+// setChainStale flips the stale flag and logs only on transitions, so a node stuck
+// for days produces one ERROR line and one recovery line rather than one per poll.
+func (s *Scheduler) setChainStale(stale bool, stuckFor time.Duration, epoch int64) {
+	s.chainMu.Lock()
+	was := s.chainStale
+	s.chainStale = stale
+	s.chainMu.Unlock()
+	if stale && !was {
+		s.logger.Error("lotus chain head is not advancing — treating Lotus as disconnected "+
+			"(check `lotus sync status`; a node that missed a network upgrade looks exactly like this)",
+			"epoch", epoch, "stuck_for", stuckFor.Round(time.Second).String(),
+			"threshold", s.policy.ChainStaleAfter.String())
+	} else if !stale && was {
+		s.logger.Info("lotus chain head advancing again", "epoch", epoch)
 	}
 }
 
@@ -179,16 +231,20 @@ func (s *Scheduler) checkWindowPost(ctx context.Context) {
 	}
 	if err != nil {
 		s.logger.Error("failed to get proving deadline", "error", err)
-		if s.policy.FailSafeOnDisconnect {
-			decision := YieldDecision{
-				State:   StateWindowPost,
-				Urgency: pb.YieldUrgency_YIELD_URGENCY_IMMEDIATE,
-				Reason:  pb.YieldReason_YIELD_REASON_LOTUS_DISCONNECTED,
-				Message: "lotus disconnected, fail-safe activated",
-			}
-			s.applyDecision(&decision)
-		}
+		s.applyLotusUnusable("lotus disconnected, fail-safe activated")
 		return
+	}
+
+	// A reachable but frozen node is as useless as an unreachable one: every
+	// deadline it reports is stale, so the yield thresholds can never fire.
+	if s.policy.ChainStaleAfter > 0 {
+		stuck := s.noteChainEpoch(info.CurrentEpoch)
+		if stuck >= s.policy.ChainStaleAfter {
+			s.setChainStale(true, stuck, info.CurrentEpoch)
+			s.applyLotusUnusable("lotus chain head not advancing, fail-safe activated")
+			return
+		}
+		s.setChainStale(false, 0, info.CurrentEpoch)
 	}
 
 	// Current deadline has sectors — evaluate it directly.
@@ -205,10 +261,11 @@ func (s *Scheduler) checkWindowPost(ctx context.Context) {
 		// No deadlines have sectors at all — stay available
 		s.logger.Debug("no deadlines with sectors found, staying available")
 		decision := YieldDecision{
-			State:   StateAvailable,
-			Urgency: pb.YieldUrgency_YIELD_URGENCY_NORMAL,
-			Reason:  pb.YieldReason_YIELD_REASON_RESUME,
-			Message: "no deadlines with sectors",
+			State:                  StateAvailable,
+			Urgency:                pb.YieldUrgency_YIELD_URGENCY_NORMAL,
+			Reason:                 pb.YieldReason_YIELD_REASON_RESUME,
+			Message:                "no deadlines with sectors",
+			SecondsUntilNextChange: untilChangeUnknown,
 		}
 		s.applyDecisionUnlessWinning(&decision)
 		return
@@ -260,6 +317,21 @@ func (s *Scheduler) checkWindowPost(ctx context.Context) {
 	s.evaluateAndApply(ctx, virtualInfo)
 }
 
+// applyLotusUnusable yields under the fail-safe policy when Lotus cannot be trusted
+// for deadline information (unreachable, or reachable but frozen).
+func (s *Scheduler) applyLotusUnusable(msg string) {
+	if !s.policy.FailSafeOnDisconnect {
+		return
+	}
+	decision := YieldDecision{
+		State:   StateWindowPost,
+		Urgency: pb.YieldUrgency_YIELD_URGENCY_IMMEDIATE,
+		Reason:  pb.YieldReason_YIELD_REASON_LOTUS_DISCONNECTED,
+		Message: msg,
+	}
+	s.applyDecision(&decision)
+}
+
 // evaluateAndApply runs the policy evaluation and applies the decision.
 // If entering WINDOW_POST, launches proof monitor if configured.
 func (s *Scheduler) evaluateAndApply(ctx context.Context, info *lotus.DeadlineInfo) {
@@ -276,10 +348,11 @@ func (s *Scheduler) evaluateAndApply(ctx context.Context, info *lotus.DeadlineIn
 		// If deadline is still open, keep AVAILABLE. When deadline closes and
 		// next poll sees a different deadline, this naturally resets.
 		decision = YieldDecision{
-			State:   StateAvailable,
-			Urgency: pb.YieldUrgency_YIELD_URGENCY_NORMAL,
-			Reason:  pb.YieldReason_YIELD_REASON_RESUME,
-			Message: "proof already completed for this deadline, staying available",
+			State:                  StateAvailable,
+			Urgency:                pb.YieldUrgency_YIELD_URGENCY_NORMAL,
+			Reason:                 pb.YieldReason_YIELD_REASON_RESUME,
+			Message:                "proof already completed for this deadline, staying available",
+			SecondsUntilNextChange: untilChangeUnknown,
 		}
 		s.applyDecisionUnlessWinning(&decision)
 		return
@@ -431,10 +504,11 @@ func (s *Scheduler) waitForProofAndResume(ctx context.Context, info *lotus.Deadl
 	s.markProofCompleted(info.PeriodStart, info.Index)
 
 	resume := YieldDecision{
-		State:   StateAvailable,
-		Urgency: pb.YieldUrgency_YIELD_URGENCY_NORMAL,
-		Reason:  pb.YieldReason_YIELD_REASON_RESUME,
-		Message: "proof complete, GPU available for inference",
+		State:                  StateAvailable,
+		Urgency:                pb.YieldUrgency_YIELD_URGENCY_NORMAL,
+		Reason:                 pb.YieldReason_YIELD_REASON_RESUME,
+		Message:                "proof complete, GPU available for inference",
+		SecondsUntilNextChange: untilChangeUnknown,
 	}
 	// Do NOT clobber an active WINNING_POST: if a block-production window is in
 	// progress, the WinningPoSt resume timer (which re-arms while a proof is active)
@@ -639,10 +713,11 @@ func (s *Scheduler) triggerWinningYield(ctx context.Context, message string) {
 					continue
 				}
 				resume := YieldDecision{
-					State:   StateAvailable,
-					Urgency: pb.YieldUrgency_YIELD_URGENCY_NORMAL,
-					Reason:  pb.YieldReason_YIELD_REASON_RESUME,
-					Message: "WinningPoSt complete, GPU available for inference",
+					State:                  StateAvailable,
+					Urgency:                pb.YieldUrgency_YIELD_URGENCY_NORMAL,
+					Reason:                 pb.YieldReason_YIELD_REASON_RESUME,
+					Message:                "WinningPoSt complete, GPU available for inference",
+					SecondsUntilNextChange: untilChangeUnknown,
 				}
 				s.applyDecision(&resume)
 				return

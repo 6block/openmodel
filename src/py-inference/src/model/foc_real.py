@@ -61,15 +61,23 @@ class RealFOCClient(FOCClient):
                 e.g., {"Qwen/Qwen2.5-1.5B-Instruct": ["cid1", "cid2", "cid3"]}
         """
         self._bridge_url = bridge_url.rstrip('/')
-        # Normalize registry: always store CIDs as a list. A model entry may be a bare
-        # CID / list of CIDs (legacy), OR a dict {"cids": [...], "sha256": "<64hex>"}.
+        # Normalize registry: always store CIDs as a list. A model entry may be a
+        # bare CID / list of CIDs (legacy), OR a dict {"cids": [...], "sha256": "<64hex>"}.
         # The sha256 (A2) is the pinned digest of the assembled weights tarball — the
         # bridge verifies it and refuses to keep a tampered download.
+        #
+        # "cids" is what a human writes in the sidecar config; "parts" is what the
+        # uploader's foc-registry.json calls the same ordered list. Both are read
+        # here rather than asking an operator to retype a 15-element CID array under
+        # a second name — a copy step that invites transcription errors into the
+        # exact values the integrity gate depends on.
         self._registry: dict[str, list[str]] = {}
         self._sha256: dict[str, str] = {}
         for model_id, entry in piece_cid_registry.items():
             if isinstance(entry, dict):
-                cids = entry.get("cids", [])
+                cids = entry.get("cids")
+                if cids is None:
+                    cids = entry.get("parts", [])
                 if entry.get("sha256"):
                     self._sha256[model_id] = str(entry["sha256"]).lower()
             else:

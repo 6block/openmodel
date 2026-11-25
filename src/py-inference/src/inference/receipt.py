@@ -25,6 +25,17 @@ logger = logging.getLogger(__name__)
 _signer: "ReceiptSigner | None" = None
 
 
+def _js(s: str) -> str:
+    """JSON-encode a string the way Go's encoding/json does.
+
+    ensure_ascii=False is load-bearing, not cosmetic: Go's json.Marshal emits non-ASCII
+    (e.g. a CJK model name) as raw UTF-8, while Python's default escapes it to \\uXXXX.
+    The two sides rebuild the SAME signed bytes, so without this a model whose name has
+    any non-ASCII character would have every one of its receipts fail verification.
+    """
+    return json.dumps(s, ensure_ascii=False)
+
+
 class ReceiptSigner:
     def __init__(self, key: ed25519.Ed25519PrivateKey, persistent: bool):
         self._key = key
@@ -72,32 +83,63 @@ def get_signer() -> ReceiptSigner:
 
 def canonical_payload(request_id: str, model: str, request_sha256: str,
                       response_sha256: str, prompt_tokens: int, completion_tokens: int,
-                      cached_tokens: int, ts: int, pubkey: str) -> bytes:
+                      cached_tokens: int, ts: int, pubkey: str,
+                      quantity: int = 0, asset_hash: str = "") -> bytes:
     """Fixed-template canonical bytes — MUST stay byte-identical with the Go verifier
-    (sp-state-agent internal/gateway/receipt.go canonicalReceiptPayload)."""
+    (sp-state-agent internal/gateway/receipt.go canonicalReceiptPayload).
+
+    Two shapes, chosen by whether the request produced a billable QUANTITY:
+
+      token model (quantity == 0): the original ten-field payload. Byte-for-byte
+        unchanged, so every receipt ever signed still verifies.
+      asset model (quantity > 0): the asset shape, for models billed per image or per
+        audio second. Such a request has no token counts to attest, and committing
+        zeros for them would be a fictitious measurement; it attests the quantity and
+        the digest of the produced bytes instead.
+
+    Note what is NOT here: the billing UNIT. A worker attests what it produced; which
+    unit prices it comes from the model's catalog entry on the gateway side, so a
+    receipt cannot select its own unit.
+    """
+    if quantity > 0:
+        return ("{" +
+                f'"asset_hash":{_js(asset_hash)},'
+                f'"model":{_js(model)},'
+                f'"quantity":{quantity},'
+                f'"request_id":{_js(request_id)},'
+                f'"request_sha256":{_js(request_sha256)},'
+                f'"response_sha256":{_js(response_sha256)},'
+                f'"ts":{ts},'
+                '"v":1}').encode("utf-8")
     return ("{" +
             f'"cached_tokens":{cached_tokens},'
             f'"completion_tokens":{completion_tokens},'
-            f'"model":{json.dumps(model)},'
+            f'"model":{_js(model)},'
             f'"prompt_tokens":{prompt_tokens},'
-            f'"pubkey":{json.dumps(pubkey)},'
-            f'"request_id":{json.dumps(request_id)},'
-            f'"request_sha256":{json.dumps(request_sha256)},'
-            f'"response_sha256":{json.dumps(response_sha256)},'
+            f'"pubkey":{_js(pubkey)},'
+            f'"request_id":{_js(request_id)},'
+            f'"request_sha256":{_js(request_sha256)},'
+            f'"response_sha256":{_js(response_sha256)},'
             f'"ts":{ts},'
             f'"v":1' +
             "}").encode("utf-8")
 
 
 def build_receipt(request_id: str, model: str, request_sha256: str, response_sha256: str,
-                  prompt_tokens: int, completion_tokens: int, cached_tokens: int) -> dict:
-    """Build and sign a receipt dict (wire form, sent to the gateway)."""
+                  prompt_tokens: int, completion_tokens: int, cached_tokens: int,
+                  quantity: int = 0, asset_hash: str = "") -> dict:
+    """Build and sign a receipt dict (wire form, sent to the gateway).
+
+    Token models pass the three token counts (quantity stays 0). Asset-billed models
+    (image, audio_second) pass quantity + asset_hash; those two fields appear in the
+    wire form only when set, so a token receipt's JSON is unchanged.
+    """
     s = get_signer()
     ts = int(time.time())
     payload = canonical_payload(request_id, model, request_sha256, response_sha256,
                                 prompt_tokens, completion_tokens, cached_tokens,
-                                ts, s.pubkey_hex)
-    return {
+                                ts, s.pubkey_hex, quantity, asset_hash)
+    receipt = {
         "v": 1,
         "request_id": request_id,
         "model": model,
@@ -110,3 +152,7 @@ def build_receipt(request_id: str, model: str, request_sha256: str, response_sha
         "pubkey": s.pubkey_hex,
         "sig": s.sign(payload),
     }
+    if quantity > 0:
+        receipt["quantity"] = quantity
+        receipt["asset_hash"] = asset_hash
+    return receipt

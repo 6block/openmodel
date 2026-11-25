@@ -1,0 +1,218 @@
+# OpenModel — multi-pool worker example (text + image generation + speech).
+# One worker, several pools, each pool on its own cards with one engine.
+# Layout shown for 8x 10 GB cards:
+#   cards 0-3  text pool    vllm, tensor parallel (text, plus a vision model to switch to)
+#   card  4    image pool   diffusion (image generation)
+#   card  5    asr + tts    speech recognition and speech synthesis sharing one card
+#   cards 6-7  free         add another pool here, or widen one above
+# Fill the fields marked "<<<". See SP-GUIDE.md section 6 and GETTING-STARTED-SP.md.
+
+mode: prod   # self-registration requires a real Lotus client; do not change
+
+lotus:
+  api_url: "http://127.0.0.1:1234/rpc/v0"
+  api_token: "${LOTUS_API_TOKEN}"   # WalletSign needs a sign-permission token; set it in .env
+  miner_address: ""            # <<< miner id, e.g. t01234 / f01234
+
+curio:
+  dsn: "host=localhost port=5433 user=yugabyte dbname=yugabyte sslmode=disable search_path=curio"
+  proof_poll_interval_sec: 5
+  proof_max_wait_sec: 1800
+  log_path: "/tmp/curio.log"
+
+scheduler:
+  window_post:
+    graceful_yield_threshold_sec: 300
+    hard_stop_threshold_sec: 120
+    resume_delay_after_close_sec: 60
+    yield_during_fault_cutoff: false
+    proof_detection_enabled: true
+  winning_post:
+    enabled: true
+    resume_delay_sec: 30
+    timeout_sec: 35
+  fail_safe_on_disconnect: true
+
+grpc:
+  port: 50051
+
+inference:
+  # Settings written here are shared by every pool unless a pool sets its own.
+  # engine, model, device_ids and mode are always per pool.
+  api_port: 8000
+  pools:
+    # Text and image understanding. A vLLM pool switches between models of its
+    # own kind; the vision limits below apply while the vision model is loaded.
+    - name: text
+      engine: "vllm"
+      model: "/models/Qwen--Qwen3-32B-AWQ"
+      device_ids: [0, 1, 2, 3]
+      mode: "tensor_parallel"
+      gpu_memory_utilization: 0.90
+      max_model_len: 8192
+      enforce_eager: true          # 10 GB cards: skip CUDA graphs, saves VRAM
+      max_images_per_prompt: 1     # vision model: image parts per chat request
+      max_image_pixels: 409600     # vision model: larger images are downscaled
+      supported_models:
+        - "/models/Qwen--Qwen3-32B-AWQ"
+        - "/models/Qwen--Qwen3-VL-8B-Instruct"
+
+    # Image generation (diffusers layout: model_index.json).
+    - name: image
+      engine: "diffusion"
+      model: "/models/stabilityai--stable-diffusion-xl-base-1.0"
+      device_ids: [4]
+      gpu_memory_utilization: 0.90
+      max_images_per_generation: 2   # images one request may ask for
+      # max_steps: 50                # denoising steps one request may ask for
+      # default_steps: 25            # steps when a request names none (default: 4 for turbo /
+      #                              # lightning / schnell models, 25 otherwise)
+      supported_models:
+        - "/models/stabilityai--stable-diffusion-xl-base-1.0"
+        - "/models/segmind--SSD-1B"
+
+    # Speech recognition (faster-whisper / CTranslate2 layout: model.bin + vocabulary).
+    # share_devices: both speech pools set it, so they may use the same card.
+    - name: asr
+      engine: "asr"
+      model: "/models/Systran--faster-whisper-small"
+      device_ids: [5]
+      share_devices: true
+      max_audio_sec: 300             # longest input one transcription accepts
+      supported_models:
+        - "/models/Systran--faster-whisper-small"
+        - "/models/Systran--faster-whisper-medium"
+
+    # Speech synthesis (Kokoro v1.0 layout: kokoro-v1_0.pth + voices/).
+    - name: tts
+      engine: "tts"
+      model: "/models/hexgrad--Kokoro-82M"
+      device_ids: [5]
+      share_devices: true
+      max_chars: 4000                # longest input text one request accepts
+      tts_voice: "af_heart"          # voice used when a request names none
+      supported_models:
+        - "/models/hexgrad--Kokoro-82M"
+
+gateway:
+  url: https://openmodel.filfox.info
+  gateway_id: openmodel-mainnet
+  auto_register: true
+
+  worker_id: ""                # <<< 1-64 chars, starts alphanumeric, then [A-Za-z0-9._-]
+  payout_address: ""           # <<< EVM address earnings settle to (0x…)
+
+  public_endpoint: https://<public-ip>:<mapped-inference-port>       # <<<
+  public_scheduler_url: https://<public-ip>:<mapped-scheduler-port>  # <<<
+  gpu_count: 6                 # <<< cards in use across all pools
+
+  # Every model any pool serves: each pool's resident model and every switch
+  # target. Each claim is admitted separately before real traffic routes to it.
+  # Entries absent from disk are fetched in the background at start-up.
+  supported_models:
+    - "/models/Qwen--Qwen3-32B-AWQ"
+    - "/models/Qwen--Qwen3-VL-8B-Instruct"
+    - "/models/stabilityai--stable-diffusion-xl-base-1.0"
+    - "/models/segmind--SSD-1B"
+    - "/models/Systran--faster-whisper-small"
+    - "/models/Systran--faster-whisper-medium"
+    - "/models/hexgrad--Kokoro-82M"
+
+  token_path: /data/gateway-token.json   # written by the scheduler on registration
+  tls_system_ca: true                    # the gateway above has a publicly-trusted certificate
+
+  mtls_front:
+    enabled: true
+    cert_dir: /data/mtls
+    inference_port: 38443      # local listen port
+    scheduler_port: 39443      # local listen port
+
+foc:
+  backend: "real"
+  real:
+    bridge_url: "http://127.0.0.1:3100"
+    # Filecoin mainnet piece CIDs, in upload order (parts are concatenated in this
+    # exact order), and the sha256 of the assembled archive: a mismatch is rejected
+    # and the file deleted, so tampered weights never reach the engine.
+    piece_cid_registry:
+      "Qwen/Qwen3-32B-AWQ":
+        cids:
+          - "bafkzcibfqcaiaoqzw3fsq6pldscbt6p3vkravhn7uoptifa3m6xvpj5l5426hvww4uxa"
+          - "bafkzcibfqcaiaoqzrz3ovwpnjxyxrg4uu7zu57b423kmfwyh4agohrvvwwcfupxrcuzq"
+          - "bafkzcibfqcaiaoqzvbawtphscqq67jrxyy5i3cycob2cqx6n32cjom4cmywxgyn76aoq"
+          - "bafkzcibfqcaiaoqzxzad4xi66gmjghjbhbin2yhqjzyehqib63mimwgscsyzkdzx3qqa"
+          - "bafkzcibfqcaiaoqzsokbdywjvzy66m67gvmgaw7paulqklzwarfz2e456f34wivxiqwa"
+          - "bafkzcibfqcaiaoqzj35bzcwaw4cwk5d4ey6albvx5zzj3lyduljsv4vbucvkzpif3izq"
+          - "bafkzcibfqcaiaoqzjt5hbv34lpydiwgojyprg4bhszsmyvuxv3zdojymmytjdpxej4ja"
+          - "bafkzcibfqcaiaoqzznfsehfihnhiisperxp7bz5qbp5h7pfp3rn2h7wvqmoxkoggci5q"
+          - "bafkzcibfqcaiaoqzgr34qro74qfxpcdh55e2uo4n34roswrl2krvvpxttukegqipsq3a"
+          - "bafkzcibfqcaiaoqzpk7bvlp46njpumndcoi3oauu53ozccyoloekrfjq3cntzudy7ala"
+          - "bafkzcibfqcaiaoqzerahx3uqcke4233mmkwd6qia635wioqbpogjcr7u7wtlt347qm4q"
+          - "bafkzcibfqcaiaoqz3dfss4ttu4u4hzma7kzgcm32umyyn6zjixvvzdzkkwfjol4nsq5q"
+          - "bafkzcibfqcaiaoqz3n4qoj6un3kni57cssupi4zpn3tacmu45zy3rs556vghomhvfmvq"
+          - "bafkzcibfqcaiaoqzyin4fr26ix2tbltdjxzjbkyqfzd7yc52hvwg2v3vvsekqf5nbi5q"
+          - "bafkzcibfqcaiaoqz6gvp4tpu5am45ab5vb4ryukmcwlgar23nynjdllhah46bqcz3yxa"
+          - "bafkzcibfqcaiaoqz66qyhd3kjkkmwhivsc7lqyde2hdb6s7jivjvyayozoxkhl43li3a"
+          - "bafkzcibfqcaiaoqz76tuns3cdo5r5bfbpif4a3xw52dvq6wc6kghm5tc3imvh5snp4ma"
+          - "bafkzcibfqcaiaoqz7dobcyuzsozdmaaeqvneib3o5wvfq5vss4c5sid4ibhuiv6fy4vq"
+          - "bafkzcibfzkliulax2zlddu3buvm756rucansnf5iyjmchug6o3zpcavh6ahztkaani2a"
+      "Qwen/Qwen3-VL-8B-Instruct":
+        cids:
+          - "bafkzcibfqcaiaoqz4pglbboqygwjzs6nsmyjwbbgubbzex3cy4cxuxr7ptxqxspx4ydq"
+          - "bafkzcibfqcaiaoqzlofwzalnctxcbpwfme6uyb4p465x464iza5xcvomkmohd4ivp4ya"
+          - "bafkzcibfqcaiaoqzcxyaezbi2bzloaonchun6bywwumdrbmujinz7poxum6cgjx3g47a"
+          - "bafkzcibfqcaiaoqzywwj23sndv5qe5zh2ouf6fl46wsb7hm2vib65ynzbty447llxufa"
+          - "bafkzcibfqcaiaoqzibnixau2c4xg66oh2xew5z7hidorrwk5fhf4byjazlqkwmhjbarq"
+          - "bafkzcibfqcaiaoqzpixpp5rg5ollu6tadtczsvpuypdqvdueabfr77hkwe6w7yapxe4a"
+          - "bafkzcibfqcaiaoqzqpzaciiaetrerrudrmzgrwwogum4posn7zyqjqc5d3zyeat6wiyq"
+          - "bafkzcibfqcaiaoqzqblx6ggz7e7r3rk6yjixcc25jipzm72wbdpth6m7ondobjbdwm2a"
+          - "bafkzcibfqcaiaoqzctbmtdtwt73dr62motglw6j3kohuqynydfqjyssk67qcrejdnijq"
+          - "bafkzcibfqcaiaoqzungy5u3pnhnhupd7fioctb3dvt5kyh4vdks6wc7adxu4kwqry4ga"
+          - "bafkzcibfqcaiaoqzl6sbnednk7ax5ci6vd6jwkt7zyc2jxyodezyljpdodx7gmebuaya"
+          - "bafkzcibfqcaiaoqzckjba2f3dvzbpqszlvdrs4tbo33ixhvm4sbhumwjr5y5fknljqkq"
+          - "bafkzcibfqcaiaoqzichskfcr6ia2tkbewv6gjc2w6vzdq6wzyjffcdavdfgndpmboypq"
+          - "bafkzcibfqcaiaoqzsx33jeyup4ktvzny3shsztmjw2b2tnubtccp3tpmbghrmd7sti5q"
+          - "bafkzcibg5gi7dhabden2xomghlqdlxmdmxupexvmvxc7sxkwui4qcn6xtzhud3jmytetc"
+        sha256: "73abacd6e09ed6e82f4c7ef2c36c582e2eff8d94ca820c89a41bc5323a117a9d"
+      "stabilityai/stable-diffusion-xl-base-1.0":
+        cids:
+          - "bafkzcibfqcaiaoqzv45gs66knuawjw6fikh4qvuzxkzbqx6zdkrca6vmb6xfkgrffica"
+          - "bafkzcibfqcaiaoqzxd7vudtcvsz46bf57egonwiy5bjw5cxufou5o6dqgtss2pqojela"
+          - "bafkzcibfqcaiaoqzvkonstxaxc7tnwxmc5lodxq77crdwy6nwnvtp4uunssnmo3xxmzq"
+          - "bafkzcibfqcaiaoqzyzeatetnss5wun2oi4hheymecby55erbbbp3p3jqpuhgpgytpe4a"
+          - "bafkzcibfqcaiaoqzdl6uw5r5qtmtolzrwvygvj5rtdztsvckmhfcmmub32h2hu266ubq"
+          - "bafkzcibfqcaiaoqz2mx72nv3rahjmmlyxaxzui6ofuzxgavs2tdnqko7qu7wsbucpmmq"
+          - "bafkzcibgzsfzjiibdf4dilzj56yomvbgtumggcnp2jnmvrh6fb3scosqwv53lzpxs2vrm"
+        sha256: "edba29fd8db91286feb5ded27e085bce63b8e5c2966f9f52a375bac26e0a1501"
+      "segmind/SSD-1B":
+        cids:
+          - "bafkzcibfqcaiaoqzb3wm7c4kkam26ltvlnlkaawcjresne2zow4unjgzk66oajquwuza"
+          - "bafkzcibfqcaiaoqzi3ownrhzil6o6jmdkp6li64uotzmzutqaqkeofc6qei2pejk7qra"
+          - "bafkzcibfqcaiaoqzhsrpjkneckj5wiraoxiibafh467ol77c6tvd7nbz2hub56kwz4ha"
+          - "bafkzcibfqcaiaoqzo6calxgahyjhp6hqknsynig37ljoaxtkspmop4ooykkypmvdsifa"
+          - "bafkzcibf5xnk4zqy3xk53enicheynocqbgq45iahl3rgban7czrhfmm3qgjls35zcuha"
+        sha256: "6de01039d9d2f8baf09c523d2cc8fef75056764ada678f0b6f4b9a57aeb0b16b"
+      "Systran/faster-whisper-small":
+        cids:
+          - "bafkzcibf3welwkiysnbfejhkjzzimlvfnwevehm4xejghovca72yrfapk2y7qw5qcutq"
+        sha256: "2c825d3bf623cdbc87910ab143d8af1423cf1745c3f96e8e6e01198abeaee7b4"
+      "Systran/faster-whisper-medium":
+        cids:
+          - "bafkzcibfqcaiaoqzajby4hway3eua35v5dy6z6bbrhbfjpjmj7folgb3w6yrb45lcqsq"
+          - "bafkzcibfvhq7uhqyh7hzbios4o6xvmvclfkg5zqaloa5prqbwuu5p3uz3fd2xsyyda3q"
+        sha256: "cbdd7a7b3f4f88c7d6df050f6c18345e134a6914e0a092c6e1f629165bf67d96"
+      "hexgrad/Kokoro-82M":
+        cids:
+          - "bafkzcibf3ogj4xqyylvgajhzjf4dlrcpjjko6u55a2pia76blogagsrs4vpyiq3shipa"
+        sha256: "530278988112571d5428583d07d5585d24e93824eef056ea9638d53a55f70a09"
+    # Models with no entry here are fetched from Hugging Face (/models/Org--Name
+    # -> Org/Name).
+
+metrics:
+  port: 9090
+  enabled: true
+  auth_token: ""               # optional static token for the local status API
+
+logging:
+  level: "info"
+  format: "text"

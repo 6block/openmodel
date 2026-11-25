@@ -26,7 +26,7 @@ class MultiInstanceConfig:
 
 @dataclass
 class InferenceConfig:
-    engine: str = "mock"  # "vllm" or "mock"
+    engine: str = "mock"  # "vllm", "diffusion", "asr", "tts" or "mock"
     model: str = "meta-llama/Llama-3-8B"
     gpu_memory_utilization: float = 0.85
     max_model_len: int = 4096
@@ -39,8 +39,32 @@ class InferenceConfig:
     api_token: str = ""
     # Reject requests asking for more than this many output tokens (0 = no cap).
     max_tokens_limit: int = 0
+    # Image-understanding models: max image parts one chat request may carry
+    # (vLLM limit_mm_per_prompt). Ignored for text-only models.
+    max_images_per_prompt: int = 1
+    # Image-understanding models: cap on pixels per image (vLLM mm_processor_kwargs
+    # max_pixels; larger images are downscaled). 0 = the model's own default. vLLM
+    # profiles memory with one maximum-size image, so on a 10 GB card a 4-bit 8B VL
+    # only fits once this is bounded.
+    max_image_pixels: int = 0
+    # Image-generation models (engine: diffusion): max images one generation
+    # request may ask for. Ignored by text and vision engines.
+    max_images_per_generation: int = 1
+    # Image-generation models: max denoising steps one request may ask for. Each step
+    # costs the whole card for a fraction of a second; without a cap one request can
+    # hold it for as long as it likes.
+    max_steps: int = 50
+    # Image-generation models: steps for a request that names none (OpenAI clients never
+    # do). 0 = by model: 4 for distilled turbo / lightning / schnell models, 25 otherwise.
+    default_steps: int = 0
     multi_gpu: MultiGpuConfig = field(default_factory=MultiGpuConfig)
     multi_instance: MultiInstanceConfig = field(default_factory=MultiInstanceConfig)
+    # Speech pools (engine: asr / tts): input caps. max_audio_sec bounds one
+    # transcription's input audio, max_chars one synthesis request's text.
+    max_audio_sec: int = 600
+    max_chars: int = 4000
+    # tts_voice: the default voice when a request names none (engine: tts).
+    tts_voice: str = ""
 
 
 @dataclass
@@ -75,9 +99,26 @@ class LoggingConfig:
 
 
 @dataclass
+class PoolConfig:
+    """One pool of a multi-pool worker: a modality on its own set of GPUs.
+
+    `inference` is a full single-engine config (engine, model, multi_gpu, limits), so
+    each pool is built by the same factory a single-engine worker uses.
+    """
+    name: str
+    inference: InferenceConfig
+    supported_models: list = field(default_factory=list)
+    # Allow this pool to share its cards with other pools that also set it (small
+    # speech engines). Off by default: overlapping cards are otherwise refused.
+    share_devices: bool = False
+
+
+@dataclass
 class AppConfig:
     mode: str = "dev"
     inference: InferenceConfig = field(default_factory=InferenceConfig)
+    # Multi-pool worker (inference.pools in YAML). Empty = the single engine above.
+    pools: list = field(default_factory=list)
     foc: FOCConfig = field(default_factory=FOCConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     grpc: GRPCConfig = field(default_factory=GRPCConfig)
@@ -125,6 +166,42 @@ def _interpolate_env_vars(content: str) -> str:
         var_name = match.group(1)
         return os.environ.get(var_name, "")
     return re.sub(r"\$\{(\w+)\}", replacer, content)
+
+
+def _parse_inference(inference_raw: dict, app_mode: str) -> InferenceConfig:
+    """Build an InferenceConfig from one inference mapping (top level or one pool)."""
+    multi_gpu = _resolve_multi_gpu(inference_raw, app_mode)
+
+    # In tensor_parallel mode, tensor_parallel_size = gpu_count
+    tp_size = inference_raw.get("tensor_parallel_size", 1)
+    if multi_gpu.mode == "tensor_parallel":
+        tp_size = multi_gpu.gpu_count
+
+    mi_raw = inference_raw.get("multi_instance", {})
+
+    return InferenceConfig(
+        engine=inference_raw.get("engine", "mock" if app_mode == "dev" else "vllm"),
+        model=inference_raw.get("model", "meta-llama/Llama-3-8B"),
+        gpu_memory_utilization=inference_raw.get("gpu_memory_utilization", 0.85),
+        max_model_len=inference_raw.get("max_model_len", 4096),
+        api_port=inference_raw.get("api_port", 8000),
+        tensor_parallel_size=tp_size,
+        enforce_eager=inference_raw.get("enforce_eager", False),
+        api_token=os.environ.get("INFERENCE_API_TOKEN", inference_raw.get("api_token", "")),
+        max_tokens_limit=inference_raw.get("max_tokens_limit", 0),
+        max_images_per_prompt=int(inference_raw.get("max_images_per_prompt", 1)),
+        max_image_pixels=int(inference_raw.get("max_image_pixels", 0)),
+        max_images_per_generation=int(inference_raw.get("max_images_per_generation", 1)),
+        max_steps=int(inference_raw.get("max_steps", 50)),
+        default_steps=int(inference_raw.get("default_steps", 0) or 0),
+        multi_gpu=multi_gpu,
+        multi_instance=MultiInstanceConfig(
+            load_balancer=mi_raw.get("load_balancer", "round_robin"),
+        ),
+        max_audio_sec=int(inference_raw.get("max_audio_sec", 600)),
+        max_chars=int(inference_raw.get("max_chars", 4000)),
+        tts_voice=str(inference_raw.get("tts_voice", "") or ""),
+    )
 
 
 def _resolve_multi_gpu(inference_raw: dict, app_mode: str) -> MultiGpuConfig:
@@ -178,31 +255,33 @@ def load_config(path: str | Path) -> AppConfig:
 
     # Parse inference config
     inference_raw = raw.get("inference", {})
+    cfg.inference = _parse_inference(inference_raw, cfg.mode)
 
-    multi_gpu = _resolve_multi_gpu(inference_raw, cfg.mode)
-
-    # In tensor_parallel mode, tensor_parallel_size = gpu_count
-    tp_size = inference_raw.get("tensor_parallel_size", 1)
-    if multi_gpu.mode == "tensor_parallel":
-        tp_size = multi_gpu.gpu_count
-
-    mi_raw = inference_raw.get("multi_instance", {})
-
-    cfg.inference = InferenceConfig(
-        engine=inference_raw.get("engine", "mock" if cfg.mode == "dev" else "vllm"),
-        model=inference_raw.get("model", "meta-llama/Llama-3-8B"),
-        gpu_memory_utilization=inference_raw.get("gpu_memory_utilization", 0.85),
-        max_model_len=inference_raw.get("max_model_len", 4096),
-        api_port=inference_raw.get("api_port", 8000),
-        tensor_parallel_size=tp_size,
-        enforce_eager=inference_raw.get("enforce_eager", False),
-        api_token=os.environ.get("INFERENCE_API_TOKEN", inference_raw.get("api_token", "")),
-        max_tokens_limit=inference_raw.get("max_tokens_limit", 0),
-        multi_gpu=multi_gpu,
-        multi_instance=MultiInstanceConfig(
-            load_balancer=mi_raw.get("load_balancer", "round_robin"),
-        ),
-    )
+    # Multi-pool worker: each pool is a complete single-engine config. Keys a pool does
+    # not set are inherited from the top-level inference block (api_token, api_port,
+    # max_tokens_limit…), so the shared settings are written once.
+    pools_raw = inference_raw.get("pools") or []
+    if pools_raw:
+        shared = {k: v for k, v in inference_raw.items() if k != "pools"}
+        for i, pr in enumerate(pools_raw):
+            merged = dict(shared)
+            # Device sets and engine choice are per pool; never inherit them.
+            for k in ("multi_gpu", "engine", "model", "multi_instance"):
+                merged.pop(k, None)
+            merged.update(pr or {})
+            if "device_ids" in merged:
+                merged["multi_gpu"] = {
+                    "mode": merged.get("mode", "tensor_parallel"),
+                    "gpu_count": len(merged["device_ids"]),
+                    "device_ids": list(merged["device_ids"]),
+                }
+            sup = merged.get("supported_models") or []
+            cfg.pools.append(PoolConfig(
+                name=str(merged.get("name") or f"pool{i}"),
+                inference=_parse_inference(merged, cfg.mode),
+                supported_models=[str(m) for m in sup if m],
+                share_devices=bool(merged.get("share_devices", False)),
+            ))
 
     foc_raw = raw.get("foc", {})
     mock_raw = foc_raw.get("mock", {})

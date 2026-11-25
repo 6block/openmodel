@@ -177,6 +177,78 @@ class EnginePool(InferenceEngine):
             return self._engines[0].current_model
         return ""
 
+    @property
+    def is_vlm(self) -> bool:
+        """True if the loaded model accepts image parts (all engines load the same model)."""
+        return bool(self._engines) and bool(getattr(self._engines[0], "is_vlm", False))
+
+    @property
+    def is_image_gen(self) -> bool:
+        """True if the loaded model GENERATES images.
+
+        Distinct from is_vlm, which means the model READS images. The two must not be
+        conflated: advertising "vision" for a generator would route chat-with-image
+        requests to a worker that cannot read them.
+        """
+        return bool(self._engines) and bool(getattr(self._engines[0], "is_image_gen", False))
+
+    @property
+    def is_asr(self) -> bool:
+        """True if the pool transcribes speech (engine: asr)."""
+        return bool(self._engines) and bool(getattr(self._engines[0], "is_asr", False))
+
+    @property
+    def is_tts(self) -> bool:
+        """True if the pool synthesizes speech (engine: tts)."""
+        return bool(self._engines) and bool(getattr(self._engines[0], "is_tts", False))
+
+    async def transcribe(self, audio: bytes, language: str | None = None):
+        return await self._speech_engine("transcribe").transcribe(audio, language)
+
+    async def transcribe_full(self, audio: bytes, language: str | None = None, **kw) -> dict:
+        return await self._speech_engine("transcribe_full").transcribe_full(audio, language, **kw)
+
+    async def synthesize(self, text: str, voice: str | None = None, speed: float = 1.0) -> bytes:
+        return await self._speech_engine("synthesize").synthesize(text, voice, speed)
+
+    def resolve_voice(self, voice: str | None) -> str:
+        return self._speech_engine("resolve_voice").resolve_voice(voice)
+
+    def _speech_engine(self, method: str):
+        """Pick an available engine that implements `method` (a speech pool may run
+        several single-GPU engines in multi_instance mode)."""
+        engines = [e for e in self._engines if hasattr(e, method)]
+        if not engines:
+            raise ValueError(f"this pool does not support {method}")
+        for e in engines:
+            if e.is_available():
+                return e
+        return engines[0]   # its own availability check raises the right error
+
+    @property
+    def context_limit(self) -> int:
+        return int(getattr(self._engines[0], "context_limit", 0) or 0) if self._engines else 0
+
+    @property
+    def max_images_per_prompt(self) -> int:
+        """Per-request image cap of the underlying engines (identical across the pool)."""
+        return int(getattr(self._engines[0], "max_images_per_prompt", 0)) if self._engines else 0
+
+    @property
+    def max_steps(self) -> int:
+        """Per-request denoising-step cap of the pool's (diffusion) engines; 0 = none."""
+        return int(getattr(self._engines[0], "max_steps", 0)) if self._engines else 0
+
+    @property
+    def default_steps(self) -> int:
+        """Denoising steps the pool's (diffusion) engines use when a request names none."""
+        return int(getattr(self._engines[0], "default_steps", 0)) if self._engines else 0
+
+    @property
+    def max_images_per_request(self) -> int:
+        """Per-request image-OUTPUT cap for a generation pool (0 for other engines)."""
+        return int(getattr(self._engines[0], "max_images_per_request", 0)) if self._engines else 0
+
     def is_available(self) -> bool:
         if self._mode == "tensor_parallel":
             return self._engines[0].is_available()
@@ -309,19 +381,46 @@ class EnginePool(InferenceEngine):
         return chosen
 
 
-def create_engine_pool(cfg) -> EnginePool:
+def create_engine_pool(cfg):
+    """Build the worker's top-level engine.
+
+    A single-engine config builds one EnginePool exactly as before. A multi-pool
+    config (cfg.pools) builds one EnginePool per pool — each from its own complete
+    single-engine config — and wraps them in a MultiPoolEngine.
+    """
+    pools = getattr(cfg, "pools", None) or []
+    if not pools:
+        return _create_single_pool(cfg.inference)
+    from .multipool import MultiPoolEngine, Pool
+    built = []
+    for pc in pools:
+        pool = _create_single_pool(pc.inference)
+        # Record the configured model so start/start_paused load the right one per
+        # pool; the top-level start() argument only concerns the primary pool.
+        for e in pool._engines:
+            if not getattr(e, "_model", ""):
+                e._model = pc.inference.model
+        built.append(Pool(
+            name=pc.name, engine=pool,
+            devices=list(pc.inference.multi_gpu.device_ids),
+            supported_models=list(pc.supported_models) or [pc.inference.model],
+            share_devices=getattr(pc, "share_devices", False),
+        ))
+        logger.info("pool %s: engine=%s model=%s devices=%s", pc.name,
+                    pc.inference.engine, pc.inference.model, pc.inference.multi_gpu.device_ids)
+    return MultiPoolEngine(built)
+
+
+def _create_single_pool(icfg) -> EnginePool:
     """Build an EnginePool from AppConfig.
 
     Handles both tensor_parallel and multi_instance modes.
     Single-GPU configurations are wrapped in a 1-engine pool for uniformity.
     """
-    from ..config import AppConfig
-    assert isinstance(cfg, AppConfig)
-
-    multi_gpu = cfg.inference.multi_gpu
+    multi_gpu = icfg.multi_gpu
     mode = multi_gpu.mode
     device_ids = multi_gpu.device_ids
-    engine_type = cfg.inference.engine
+    engine_type = icfg.engine
 
     logger.info("creating engine pool: type=%s, mode=%s, gpu_count=%d, devices=%s",
                 engine_type, mode, multi_gpu.gpu_count, device_ids)
@@ -330,14 +429,23 @@ def create_engine_pool(cfg) -> EnginePool:
         # Single engine spanning all GPUs
         engine = create_engine(
             engine_type,
-            gpu_memory_utilization=cfg.inference.gpu_memory_utilization,
-            max_model_len=cfg.inference.max_model_len,
+            gpu_memory_utilization=icfg.gpu_memory_utilization,
+            max_model_len=icfg.max_model_len,
             tensor_parallel_size=multi_gpu.gpu_count,
             device_ids=device_ids,
             gpu_id=0,  # mock: show as GPU 0
-            enforce_eager=cfg.inference.enforce_eager,
+            enforce_eager=icfg.enforce_eager,
+            max_images_per_prompt=icfg.max_images_per_prompt,
+            max_image_pixels=getattr(icfg, "max_image_pixels", 0),
+            max_images_per_request=icfg.max_images_per_generation,
+            max_steps=getattr(icfg, "max_steps", 50),
+            default_steps=getattr(icfg, "default_steps", 0),
+            max_audio_sec=icfg.max_audio_sec,
+            max_chars=icfg.max_chars,
+            tts_voice=icfg.tts_voice,
         )
-        return EnginePool(mode="tensor_parallel", engines=[engine])
+        return _tag_engine_kind(EnginePool(mode="tensor_parallel", engines=[engine]),
+                                engine_type)
 
     elif mode == "multi_instance":
         # One engine per device
@@ -345,19 +453,33 @@ def create_engine_pool(cfg) -> EnginePool:
         for dev_id in device_ids:
             engine = create_engine(
                 engine_type,
-                gpu_memory_utilization=cfg.inference.gpu_memory_utilization,
-                max_model_len=cfg.inference.max_model_len,
+                gpu_memory_utilization=icfg.gpu_memory_utilization,
+                max_model_len=icfg.max_model_len,
                 tensor_parallel_size=1,
                 device_ids=[dev_id],
                 gpu_id=dev_id,  # mock: show GPU ID
-                enforce_eager=cfg.inference.enforce_eager,
+                enforce_eager=icfg.enforce_eager,
+                max_images_per_prompt=icfg.max_images_per_prompt,
+                max_image_pixels=getattr(icfg, "max_image_pixels", 0),
+                max_images_per_request=icfg.max_images_per_generation,
+                max_steps=getattr(icfg, "max_steps", 50),
+            default_steps=getattr(icfg, "default_steps", 0),
+                max_audio_sec=icfg.max_audio_sec,
+                max_chars=icfg.max_chars,
+                tts_voice=icfg.tts_voice,
             )
             engines.append(engine)
-        return EnginePool(
+        return _tag_engine_kind(EnginePool(
             mode="multi_instance",
             engines=engines,
-            lb_strategy=cfg.inference.multi_instance.load_balancer,
-        )
+            lb_strategy=icfg.multi_instance.load_balancer,
+        ), engine_type)
 
     else:
         raise ValueError(f"Unknown multi_gpu mode: {mode}")
+
+
+def _tag_engine_kind(pool: "EnginePool", engine_type: str) -> "EnginePool":
+    # The engine kind a switch target must match (model_kind.check_engine_fits).
+    pool.engine_kind = engine_type
+    return pool

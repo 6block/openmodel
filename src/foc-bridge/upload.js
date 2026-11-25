@@ -7,6 +7,12 @@
  *
  * Usage:
  *   node upload.js --model-dir /path/to/model [--name "Qwen/Qwen2.5-1.5B-Instruct"]
+ *                  [--provider-id 5[,12]]
+ *
+ * --provider-id stores the parts with the listed storage providers (one copy each)
+ * instead of letting the SDK choose. The SDK's own choice only considers providers
+ * whose /pdp/ping health check answers 200; naming a provider skips that check, so
+ * use it when a known provider stores normally but its ping endpoint does not.
  */
 
 import 'dotenv/config';
@@ -39,6 +45,9 @@ if (NETWORK !== 'mainnet' && RPC_URL.includes('api.node.glif.io')) {
   console.error('REFUSING: calibration upload with a MAINNET RPC — would sign real-chain transactions from a test flow.');
   process.exit(1);
 }
+const PROVIDER_IDS = process.argv.includes('--provider-id')
+  ? process.argv[process.argv.indexOf('--provider-id')+1].split(',').map((v) => BigInt(v.trim()))
+  : null;
 const MAX_PART_SIZE = 900 * 1024 * 1024; // 900 MB per part
 // Attempts per part. The upload itself is reliable; the on-chain commit that
 // follows it times out sporadically on the provider side, so a retry usually
@@ -120,6 +129,14 @@ async function main() {
   const sizeMB = (tarStat.size / (1024 * 1024)).toFixed(1);
   console.log(`Archive size: ${sizeMB} MB`);
 
+  // Digest of the WHOLE archive, computed before it is split and deleted. This is
+  // the value a downloader pins (piece_cid_registry {cids, sha256}) so the bridge
+  // can refuse a tampered or mis-assembled download. Streamed: the archive may be
+  // tens of GB.
+  console.log(`Hashing archive (sha256)...`);
+  const tarSha256 = execSync(`sha256sum "${tarPath}"`).toString().split(/\s+/)[0];
+  console.log(`Archive sha256: ${tarSha256}`);
+
   // Split into parts if needed
   const splitDir = join(tmpdir(), `foc-split-${Date.now()}`);
   execSync(`mkdir -p "${splitDir}"`);
@@ -147,6 +164,7 @@ async function main() {
     transport: http(RPC_URL),
   });
   console.log(`Synapse SDK initialized (network ${NETWORK}, chain ${CHAIN.id}, view ${CHAIN.contracts.fwssView.address})`);
+  if (PROVIDER_IDS) console.log(`Storage providers: ${PROVIDER_IDS.join(', ')} (named; SDK health check skipped)`);
 
   // Upload each part
   const results = [];
@@ -170,7 +188,8 @@ async function main() {
     let result;
     for (let attempt = 1; ; attempt++) {
       try {
-        result = await synapse.storage.upload(data);
+        result = await synapse.storage.upload(data,
+          PROVIDER_IDS ? { providerIds: PROVIDER_IDS, copies: PROVIDER_IDS.length } : undefined);
         break;
       } catch (err) {
         const msg = err.shortMessage || err.message || String(err);
@@ -222,8 +241,10 @@ async function main() {
     parts: results.map((r) => r.pieceCid),
     partSizes: results.map((r) => r.sizeBytes),
     totalBytes: results.reduce((a, r) => a + r.sizeBytes, 0),
+    sha256: tarSha256,
     uploadedAt: new Date().toISOString(),
   };
+  console.log(`Archive sha256 (pin this in piece_cid_registry): ${tarSha256}`);
   try {
     writeFileSync(registryPath, JSON.stringify(registry, null, 2) + '\n');
     console.log(`Registry updated: ${registryPath}`);

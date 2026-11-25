@@ -195,10 +195,11 @@ def test_chat_prompt_uses_model_template(monkeypatch):
             self.role, self.content = role, content
 
     out = api_server._chat_prompt(Eng(), [Msg("user", "hi")])
-    assert out.startswith("TPL[think=False]"), \
+    assert out[0].startswith("TPL[think=False]"), \
         "template must be applied with enable_thinking disabled"
-    assert "<|user|>hi" in out and out.endswith("<|assistant|>")
-    assert "user: hi" not in out, "bare join must not leak once a template exists"
+    assert "<|user|>hi" in out[0] and out[0].endswith("<|assistant|>")
+    assert "user: hi" not in out[0], "bare join must not leak once a template exists"
+    assert out[1] == [], "no images for text-only content"
 
 
 def test_chat_prompt_falls_back_without_template(monkeypatch):
@@ -215,4 +216,5 @@ def test_chat_prompt_falls_back_without_template(monkeypatch):
             self.role, self.content = role, content
 
     out = api_server._chat_prompt(Eng(), [Msg("user", "hi"), Msg("assistant", "yo")])
-    assert out == "user: hi\nassistant: yo"
+    assert out[0] == "user: hi\nassistant: yo"
+    assert out[1] == []

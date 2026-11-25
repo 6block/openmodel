@@ -160,6 +160,7 @@ func main() {
 		WindowPost:           cfg.Scheduler.WindowPost,
 		WinningPost:          cfg.Scheduler.WinningPost,
 		FailSafeOnDisconnect: cfg.Scheduler.FailSafeOnDisconnect,
+		ChainStaleAfter:      time.Duration(cfg.Scheduler.ChainStaleAfterSec) * time.Second,
 	}
 	sched := scheduler.New(lotusClient, policy, logger)
 

@@ -45,6 +45,9 @@ inference:
   model: "Qwen/Qwen3-4B-Instruct-2507"   # production-catalog entry (qwen3-4b); just fits one 10 GB card
   gpu_memory_utilization: 0.93
   max_model_len: 4096
+  # Required on 10 GB cards: CUDA graphs take the memory the KV cache needs
+  # (with them, 4B at 4096 tokens leaves 0.51 GiB for 0.56 GiB needed).
+  enforce_eager: true
   api_port: 8000
 
   multi_gpu:

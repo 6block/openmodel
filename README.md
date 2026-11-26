@@ -346,6 +346,25 @@ speech libraries); on GitHub Releases it ships gzip-compressed as split volumes
   Container Toolkit is installed (`docker info | grep -i nvidia`).
 - **Inference stuck loading**: first model load downloads weights; check
   `docker logs openmodel-inference` and your `HF_ENDPOINT` reachability.
+- **`Failed to initialize NVML: Unknown Error` inside the inference container**
+  (the text pool fails to reload after a mining yield; `docker exec
+  openmodel-inference nvidia-smi` shows the same error): with Docker's systemd
+  cgroup driver, a `systemctl daemon-reload` — triggered by snap refreshes and
+  package installs — drops the GPU device rules of running containers. List the
+  device nodes explicitly so they survive it, in a `docker-compose.override.yml`
+  next to the compose file (one `/dev/nvidiaN` line per card, as `ls /dev/nvidia*`
+  shows on the host), then `docker compose up -d inference`:
+
+  ```yaml
+  services:
+    inference:
+      devices:
+        - /dev/nvidia0:/dev/nvidia0        # one line per card
+        - /dev/nvidiactl:/dev/nvidiactl
+        - /dev/nvidia-uvm:/dev/nvidia-uvm
+        - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+        - /dev/nvidia-modeset:/dev/nvidia-modeset
+  ```
 - **Scheduler unhealthy**: verify `LOTUS_API_TOKEN` and that the Lotus RPC
   (port 1234) is reachable from the container (`network_mode: host`).
 - **503 responses**: the miner is proving; this is by design. Honor
